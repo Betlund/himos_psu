@@ -7,7 +7,15 @@ name = "himos-psu"
 version = "0.2.0"
 description = "Open-source Linux monitor, fan controller and energy tracker for Segotep / Kunlun HiMOS digital power supplies (e.g. KE-1300P)"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Hardware",
+]
 dependencies = []
 
 [project.optional-dependencies]
