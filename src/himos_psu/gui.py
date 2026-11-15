@@ -1,0 +1,779 @@
+"""Native PySide6 desktop monitor and fan controller for Segotep / Kunlun PSUs."""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+from collections import deque
+from pathlib import Path
+from typing import Sequence
+
+from PySide6 import QtCore, QtGui, QtWidgets
+
+from .client import PowerSupplyClient
+from .fan_curve import (
+    DEFAULT_CUSTOM_POINTS,
+    Point,
+    _js_round,
+    clamp_dragged_point,
+    resample_fan_curve,
+)
+from .protocol import (
+    FanMode,
+    PowerInfo,
+    PowerStatus,
+    RefreshMode,
+    TempSensor,
+    format_warranty_badge,
+)
+
+CONFIG_PATH = Path.home() / ".config" / "himos-psu" / "settings.json"
+
+
+def _to_display_temp(celsius: float, fahrenheit: bool) -> float:
+    return (1.8 * celsius + 32.0) if fahrenheit else celsius
+
+
+def _load_local_config(path: Path = CONFIG_PATH) -> dict:
+    try:
+        if path.is_file():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def _save_local_config(data: dict, path: Path = CONFIG_PATH) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+class FanCurveWidget(QtWidgets.QWidget):
+    """Interactive 5-point ControlChart widget enforcing HiMOS drag constraints."""
+
+    points_changed = QtCore.Signal(list)
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setMinimumSize(400, 250)
+        self.setMouseTracking(True)
+        self._points: list[Point] = list(DEFAULT_CUSTOM_POINTS)
+        self._editable: bool = False
+        self._fahrenheit: bool = False
+        self._dragging_idx: int | None = None
+        self._hover_idx: int | None = None
+        self._pad_left = 48
+        self._pad_right = 20
+        self._pad_top = 18
+        self._pad_bottom = 34
+
+    def points(self) -> list[Point]:
+        return list(self._points)
+
+    def set_points(self, points: Sequence[Sequence[int]]) -> None:
+        self._points = [(int(p[0]), int(p[1])) for p in points]
+        self.update()
+
+    def set_editable(self, editable: bool) -> None:
+        self._editable = editable
+        self._dragging_idx = None
+        self.setCursor(QtCore.Qt.CursorShape.ArrowCursor)
+        self.update()
+
+    def set_fahrenheit(self, fahrenheit: bool) -> None:
+        self._fahrenheit = fahrenheit
+        self.update()
+
+    def _plot_rect(self) -> QtCore.QRectF:
+        return QtCore.QRectF(
+            self._pad_left,
+            self._pad_top,
+            max(80.0, self.width() - self._pad_left - self._pad_right),
+            max(80.0, self.height() - self._pad_top - self._pad_bottom),
+        )
+
+    def _to_pixel(self, pt: Point) -> QtCore.QPointF:
+        rect = self._plot_rect()
+        px = rect.left() + (pt[0] / 100.0) * rect.width()
+        py = rect.bottom() - (pt[1] / 100.0) * rect.height()
+        return QtCore.QPointF(px, py)
+
+    def _from_pixel(self, pos: QtCore.QPointF) -> tuple[int, int]:
+        rect = self._plot_rect()
+        x = ((pos.x() - rect.left()) / rect.width()) * 100.0
+        y = ((rect.bottom() - pos.y()) / rect.height()) * 100.0
+        return int(x), int(y)
+
+    def _hit_test(self, pos: QtCore.QPointF) -> int | None:
+        for idx in (1, 2, 3):
+            px = self._to_pixel(self._points[idx])
+            if QtCore.QLineF(pos, px).length() <= 13.0:
+                return idx
+        return None
+
+    def drag_point_to(self, index: int, temp_pct: int, duty_pct: int) -> None:
+        """Move control point programmatically or from pointer drag."""
+        self._points = clamp_dragged_point(self._points, index, temp_pct, duty_pct)
+        self.points_changed.emit([list(p) for p in self._points])
+        self.update()
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        if self._editable and event.button() == QtCore.Qt.MouseButton.LeftButton:
+            idx = self._hit_test(event.position())
+            if idx is not None:
+                self._dragging_idx = idx
+                self.setCursor(QtCore.Qt.CursorShape.ClosedHandCursor)
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
+        if self._dragging_idx is not None and self._editable:
+            gx, gy = self._from_pixel(event.position())
+            self.drag_point_to(self._dragging_idx, gx, gy)
+            event.accept()
+            return
+        if self._editable:
+            hit = self._hit_test(event.position())
+            if hit != self._hover_idx:
+                self._hover_idx = hit
+                self.setCursor(
+                    QtCore.Qt.CursorShape.OpenHandCursor if hit is not None else QtCore.Qt.CursorShape.ArrowCursor
+                )
+                self.update()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
+        if self._dragging_idx is not None:
+            self._dragging_idx = None
+            self.setCursor(
+                QtCore.Qt.CursorShape.OpenHandCursor
+                if (self._editable and self._hit_test(event.position()) is not None)
+                else QtCore.Qt.CursorShape.ArrowCursor
+            )
+            self.update()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+        del event
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        rect = self._plot_rect()
+
+        painter.fillRect(self.rect(), QtGui.QColor("#11161d"))
+        painter.fillRect(rect, QtGui.QColor("#161d26"))
+
+        grid_pen = QtGui.QPen(QtGui.QColor("#2b3645"), 1, QtCore.Qt.PenStyle.DashLine)
+        text_pen = QtGui.QPen(QtGui.QColor("#9aa8ba"))
+        font = painter.font()
+        font.setPointSize(8)
+        painter.setFont(font)
+
+        for tick in range(0, 101, 20):
+            x = rect.left() + (tick / 100.0) * rect.width()
+            y = rect.bottom() - (tick / 100.0) * rect.height()
+            painter.setPen(grid_pen)
+            painter.drawLine(QtCore.QPointF(x, rect.top()), QtCore.QPointF(x, rect.bottom()))
+            painter.drawLine(QtCore.QPointF(rect.left(), y), QtCore.QPointF(rect.right(), y))
+
+            painter.setPen(text_pen)
+            temp_val = _to_display_temp(float(tick), self._fahrenheit)
+            unit = "°F" if self._fahrenheit else "°C"
+            x_label = f"{temp_val:.0f}{unit}" if tick in (0, 100) else f"{temp_val:.0f}"
+            painter.drawText(
+                QtCore.QRectF(x - 24, rect.bottom() + 4, 48, 20),
+                QtCore.Qt.AlignmentFlag.AlignHCenter | QtCore.Qt.AlignmentFlag.AlignTop,
+                x_label,
+            )
+            y_label = "%" if tick == 0 else str(tick)
+            painter.drawText(
+                QtCore.QRectF(4, y - 9, self._pad_left - 10, 18),
+                QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter,
+                y_label,
+            )
+
+        # Draw 21 firmware resampled points subtly so users can verify the x9 wire output.
+        if self._editable:
+            raw = resample_fan_curve(self._points, validate=False)
+            step_color = QtGui.QColor("#38bdf8")
+            painter.setPen(QtCore.Qt.PenStyle.NoPen)
+            painter.setBrush(step_color)
+            for idx, duty in enumerate(raw[:21]):
+                tx = _js_round(self._points[0][0] + (self._points[-1][0] - self._points[0][0]) * (idx / 20))
+                pt_px = self._to_pixel((tx, duty))
+                painter.drawEllipse(pt_px, 2.3, 2.3)
+
+        line_color = QtGui.QColor("#e2f1ff") if self._editable else QtGui.QColor("#525b68")
+        line_width = 3.0 if self._editable else 2.0
+        painter.setPen(QtGui.QPen(line_color, line_width))
+        poly = QtGui.QPolygonF([self._to_pixel(pt) for pt in self._points])
+        painter.drawPolyline(poly)
+
+        for idx, pt in enumerate(self._points):
+            px = self._to_pixel(pt)
+            is_movable = self._editable and idx in (1, 2, 3)
+            radius = 6.5 if is_movable else 4.0
+            if idx == self._dragging_idx or idx == self._hover_idx:
+                radius = 8.0
+            fill = QtGui.QColor("#38bdf8") if is_movable else line_color
+            painter.setPen(QtGui.QPen(QtGui.QColor("#0d1117"), 1.5))
+            painter.setBrush(fill)
+            painter.drawEllipse(px, radius, radius)
+
+            if self._editable and idx in (1, 2, 3):
+                painter.setPen(QtGui.QColor("#dce7f5"))
+                painter.drawText(
+                    QtCore.QRectF(px.x() - 30, px.y() - 24, 60, 16),
+                    QtCore.Qt.AlignmentFlag.AlignHCenter,
+                    f"{pt[0]}%/{pt[1]}%",
+                )
+
+
+class HistoryChartWidget(QtWidgets.QWidget):
+    """Lightweight scrolling chart for real-time input power (W) and selected temperature."""
+
+    def __init__(self, max_points: int = 120, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setMinimumHeight(130)
+        self._powers: deque[float] = deque(maxlen=max_points)
+        self._temps: deque[tuple[float, float, float]] = deque(maxlen=max_points)
+        self._sensor = TempSensor.LOW_VOLTAGE
+        self._fahrenheit = False
+
+    def append_sample(self, status: PowerStatus) -> None:
+        self._powers.append(status.power)
+        self._temps.append(
+            (
+                status.high_voltage_temperature,
+                status.low_voltage_temperature,
+                status.environment_temperature,
+            )
+        )
+        self.update()
+
+    def set_sensor(self, sensor: TempSensor) -> None:
+        self._sensor = sensor
+        self.update()
+
+    def set_fahrenheit(self, fahrenheit: bool) -> None:
+        self._fahrenheit = fahrenheit
+        self.update()
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+        del event
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QtGui.QColor("#11161d"))
+
+        rect = self.rect().adjusted(48, 22, -48, -16)
+        painter.fillRect(rect, QtGui.QColor("#161d26"))
+
+        if len(self._powers) < 2:
+            painter.setPen(QtGui.QColor("#8090a3"))
+            painter.drawText(rect, QtCore.Qt.AlignmentFlag.AlignCenter, "等待连续遥测数据...")
+            return
+
+        sensor_idx = int(self._sensor)
+        p_max = max(300.0, max(self._powers) * 1.15)
+        t_vals = [_to_display_temp(sample[sensor_idx], self._fahrenheit) for sample in self._temps]
+        t_min = 0.0 if not self._fahrenheit else 32.0
+        t_max = max(100.0 if not self._fahrenheit else 212.0, max(t_vals) + 10.0)
+
+        def draw_series(vals: Sequence[float], v_min: float, v_max: float, color: str) -> None:
+            pts = []
+            span = max(1.0, v_max - v_min)
+            n = len(vals)
+            for idx, v in enumerate(vals):
+                x = rect.left() + (idx / max(1, n - 1)) * rect.width()
+                norm = max(0.0, min(1.0, (v - v_min) / span))
+                y = rect.bottom() - norm * rect.height()
+                pts.append(QtCore.QPointF(x, y))
+            painter.setPen(QtGui.QPen(QtGui.QColor(color), 2.0))
+            painter.drawPolyline(QtGui.QPolygonF(pts))
+
+        draw_series(list(self._powers), 0.0, p_max, "#38bdf8")
+        draw_series(t_vals, t_min, t_max, "#fb923c")
+
+        unit = "°F" if self._fahrenheit else "°C"
+        painter.setPen(QtGui.QColor("#38bdf8"))
+        painter.drawText(8, 15, f"功率 W (0~{p_max:.0f}W): {self._powers[-1]:.1f}W")
+        painter.setPen(QtGui.QColor("#fb923c"))
+        painter.drawText(rect.right() - 150, 15, f"温度 {unit}: {t_vals[-1]:.1f}{unit}")
+
+
+class TelemetryWorker(QtCore.QThread):
+    """Background serial polling thread keeping UI responsive."""
+
+    info_updated = QtCore.Signal(object, str)
+    status_updated = QtCore.Signal(object)
+    error_occurred = QtCore.Signal(str)
+    connected = QtCore.Signal(str)
+
+    def __init__(self, client: PowerSupplyClient, parent: QtCore.QObject | None = None) -> None:
+        super().__init__(parent)
+        self.client = client
+        self._running = True
+
+    def run(self) -> None:
+        try:
+            self.client.open()
+            self.connected.emit(self.client.port_name)
+            info, sn = self.client.query_specs_and_sn(timeout=2.0)
+            if info is not None or sn:
+                self.info_updated.emit(info, sn)
+        except Exception as exc:
+            self.error_occurred.emit(str(exc))
+            return
+
+        while self._running:
+            try:
+                events = self.client.poll_frames(timeout=0.05)
+                for _, parsed in events:
+                    if isinstance(parsed, PowerInfo):
+                        self.info_updated.emit(parsed, self.client.sn)
+                    elif isinstance(parsed, PowerStatus):
+                        self.status_updated.emit(parsed)
+            except Exception as exc:
+                self.error_occurred.emit(str(exc))
+                break
+
+    def stop(self) -> None:
+        self._running = False
+
+
+class MainWindow(QtWidgets.QMainWindow):
+    """Main desktop dashboard for HiMOS / Kunlun KE-1300P power supplies."""
+
+    def __init__(
+        self,
+        port: str | None = None,
+        mock: bool = False,
+        client: PowerSupplyClient | None = None,
+        config_path: Path | None = None,
+    ) -> None:
+        super().__init__()
+        self._port = port
+        self._mock = mock
+        self._config_path = config_path or CONFIG_PATH
+        self.client = client or PowerSupplyClient(port=port, mock=mock)
+        self._worker: TelemetryWorker | None = None
+        self._cfg = _load_local_config(self._config_path)
+        self._fahrenheit = bool(self._cfg.get("fahrenheit", False))
+        self._sensor = TempSensor(int(self._cfg.get("sensor", int(TempSensor.LOW_VOLTAGE))))
+        self._waiting_clean_exit = False
+        self._pending_mode: FanMode | None = None
+        self._mode_grace_until = 0.0
+        self._last_status: PowerStatus | None = None
+        self._current_sn = ""
+        self._current_info: PowerInfo | None = None
+
+        self.setWindowTitle("HiMOS PSU Linux 监控控制面板")
+        self.resize(1020, 680)
+        self._apply_dark_style()
+        self._build_ui()
+        self._load_saved_curve()
+        self._start_worker()
+
+    def _apply_dark_style(self) -> None:
+        self.setStyleSheet(
+            """
+            QMainWindow, QWidget { background: #0d1117; color: #e6edf3; font-size: 13px; }
+            QGroupBox { border: 1px solid #253040; border-radius: 8px; margin-top: 10px; padding: 10px; font-weight: bold; }
+            QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; color: #7dd3fc; }
+            QPushButton { background: #1c2430; border: 1px solid #304054; border-radius: 6px; padding: 6px 12px; }
+            QPushButton:hover { background: #263244; }
+            QPushButton:checked { background: #0284c7; border-color: #38bdf8; color: #ffffff; font-weight: bold; }
+            QPushButton#danger { background: #4c1d24; border-color: #991b1b; }
+            QPushButton#danger:hover { background: #7f1d1d; }
+            QComboBox { background: #1c2430; border: 1px solid #304054; border-radius: 5px; padding: 4px 8px; }
+            QLabel#metricValue { font-size: 22px; font-weight: bold; color: #38bdf8; }
+            QLabel#badge { background: #1e293b; border: 1px solid #38bdf8; border-radius: 5px; padding: 2px 8px; color: #7dd3fc; font-weight: bold; }
+            """
+        )
+
+    def _build_ui(self) -> None:
+        root = QtWidgets.QWidget()
+        self.setCentralWidget(root)
+        main_layout = QtWidgets.QVBoxLayout(root)
+        main_layout.setContentsMargins(12, 10, 12, 10)
+        main_layout.setSpacing(10)
+
+        # Header bar
+        header = QtWidgets.QHBoxLayout()
+        self.title_label = QtWidgets.QLabel("KUNLUN / HiMOS 数字电源")
+        font = self.title_label.font()
+        font.setPointSize(14)
+        font.setBold(True)
+        self.title_label.setFont(font)
+        header.addWidget(self.title_label)
+
+        self.edition_badge = QtWidgets.QLabel("")
+        self.edition_badge.setObjectName("badge")
+        self.edition_badge.setVisible(False)
+        header.addWidget(self.edition_badge)
+        header.addStretch(1)
+
+        self.port_label = QtWidgets.QLabel("状态: 正在连接...")
+        header.addWidget(self.port_label)
+
+        self.unit_btn = QtWidgets.QPushButton("°F" if self._fahrenheit else "°C")
+        self.unit_btn.setCheckable(True)
+        self.unit_btn.setChecked(self._fahrenheit)
+        self.unit_btn.clicked.connect(self._toggle_temp_unit)
+        header.addWidget(self.unit_btn)
+        main_layout.addLayout(header)
+
+        # Body: left spec column + right live dashboard/control column
+        body = QtWidgets.QHBoxLayout()
+        main_layout.addLayout(body, 1)
+
+        # Left column: hardware specs + rails + fault clear
+        left_col = QtWidgets.QVBoxLayout()
+        body.addLayout(left_col, 35)
+
+        spec_box = QtWidgets.QGroupBox("电源规格信息")
+        spec_form = QtWidgets.QFormLayout(spec_box)
+        self.spec_labels: dict[str, QtWidgets.QLabel] = {}
+        for key, title in (
+            ("model", "电源型号:"),
+            ("rated", "额定功率:"),
+            ("cert", "80 PLUS:"),
+            ("io_max", "I/O 最大电流:"),
+            ("ac_range", "输入电压范围:"),
+            ("fw", "固件版本:"),
+            ("vendor", "代工/厂商:"),
+            ("sn", "序列号:"),
+            ("warranty", "质保:"),
+        ):
+            lbl = QtWidgets.QLabel("--")
+            lbl.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+            self.spec_labels[key] = lbl
+            spec_form.addRow(title, lbl)
+        left_col.addWidget(spec_box)
+
+        rails_box = QtWidgets.QGroupBox("直流各路输出")
+        rails_form = QtWidgets.QFormLayout(rails_box)
+        self.rail_labels: dict[str, QtWidgets.QLabel] = {}
+        for key, title in (
+            ("v12", "+12V:"),
+            ("v5", "+5V:"),
+            ("v33", "+3.3V:"),
+            ("v5sb", "+5V SB:"),
+        ):
+            lbl = QtWidgets.QLabel("-- V")
+            self.rail_labels[key] = lbl
+            rails_form.addRow(title, lbl)
+        left_col.addWidget(rails_box)
+
+        fault_box = QtWidgets.QGroupBox("故障保护")
+        fault_layout = QtWidgets.QHBoxLayout(fault_box)
+        self.fault_label = QtWidgets.QLabel("故障码: 0x0000")
+        fault_layout.addWidget(self.fault_label, 1)
+        self.clear_fault_btn = QtWidgets.QPushButton("清除故障码")
+        self.clear_fault_btn.setObjectName("danger")
+        self.clear_fault_btn.clicked.connect(self._on_clear_fault_clicked)
+        fault_layout.addWidget(self.clear_fault_btn)
+        left_col.addWidget(fault_box)
+        left_col.addStretch(1)
+
+        # Right column: live telemetry cards + history + fan controls + interactive curve
+        right_col = QtWidgets.QVBoxLayout()
+        body.addLayout(right_col, 65)
+
+        metrics_row = QtWidgets.QHBoxLayout()
+        self.metric_labels: dict[str, QtWidgets.QLabel] = {}
+        for key, title in (
+            ("power", "输入功率"),
+            ("temp", "电源温度"),
+            ("rpm", "风扇转速"),
+            ("ac_v", "输入电压"),
+            ("freq", "输入频率"),
+        ):
+            card = QtWidgets.QGroupBox(title)
+            v = QtWidgets.QVBoxLayout(card)
+            lbl = QtWidgets.QLabel("--")
+            lbl.setObjectName("metricValue")
+            lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            v.addWidget(lbl)
+            self.metric_labels[key] = lbl
+            metrics_row.addWidget(card)
+        right_col.addLayout(metrics_row)
+
+        self.history_chart = HistoryChartWidget()
+        self.history_chart.set_sensor(self._sensor)
+        self.history_chart.set_fahrenheit(self._fahrenheit)
+        right_col.addWidget(self.history_chart)
+
+        # Thermal probe + refresh selector row
+        param_row = QtWidgets.QHBoxLayout()
+        param_row.addWidget(QtWidgets.QLabel("温度显示传感器:"))
+        self.sensor_group = QtWidgets.QButtonGroup(self)
+        for sensor, text in (
+            (TempSensor.HIGH_VOLTAGE, "高压区"),
+            (TempSensor.LOW_VOLTAGE, "低压区"),
+            (TempSensor.ENVIRONMENT, "环境"),
+        ):
+            rb = QtWidgets.QRadioButton(text)
+            rb.setChecked(sensor == self._sensor)
+            self.sensor_group.addButton(rb, int(sensor))
+            param_row.addWidget(rb)
+        self.sensor_group.idClicked.connect(self._on_sensor_changed)
+
+        param_row.addStretch(1)
+        param_row.addWidget(QtWidgets.QLabel("刷新周期:"))
+        self.refresh_combo = QtWidgets.QComboBox()
+        for rm in RefreshMode:
+            self.refresh_combo.addItem(f"{rm.interval_ms} ms", int(rm))
+        self.refresh_combo.activated.connect(self._on_refresh_selected)
+        param_row.addWidget(self.refresh_combo)
+        right_col.addLayout(param_row)
+
+        # Fan control group
+        fan_box = QtWidgets.QGroupBox("风扇调速控制")
+        fan_layout = QtWidgets.QVBoxLayout(fan_box)
+
+        mode_row = QtWidgets.QHBoxLayout()
+        self.mode_buttons: dict[FanMode, QtWidgets.QPushButton] = {}
+        self.mode_group = QtWidgets.QButtonGroup(self)
+        self.mode_group.setExclusive(True)
+        for mode, text in (
+            (FanMode.SILENT, "静音 Silent"),
+            (FanMode.AUTO, "自动 Auto"),
+            (FanMode.PERFORMANCE, "超频 Perf"),
+            (FanMode.CUSTOM, "自定义 Custom"),
+            (FanMode.CLEAN, "清灰 Clean"),
+        ):
+            btn = QtWidgets.QPushButton(text)
+            btn.setCheckable(True)
+            self.mode_group.addButton(btn, int(mode))
+            self.mode_buttons[mode] = btn
+            mode_row.addWidget(btn)
+        self.mode_group.idClicked.connect(self._on_mode_clicked)
+        fan_layout.addLayout(mode_row)
+
+        self.curve_widget = FanCurveWidget()
+        self.curve_widget.set_fahrenheit(self._fahrenheit)
+        self.curve_widget.points_changed.connect(self._on_curve_dragged)
+        fan_layout.addWidget(self.curve_widget, 1)
+
+        curve_btn_row = QtWidgets.QHBoxLayout()
+        self.curve_info_label = QtWidgets.QLabel(f"控制点: {list(DEFAULT_CUSTOM_POINTS)}")
+        curve_btn_row.addWidget(self.curve_info_label, 1)
+        self.reset_curve_btn = QtWidgets.QPushButton("恢复默认曲线")
+        self.reset_curve_btn.clicked.connect(self._on_reset_curve)
+        curve_btn_row.addWidget(self.reset_curve_btn)
+        self.apply_curve_btn = QtWidgets.QPushButton("应用自定义曲线")
+        self.apply_curve_btn.clicked.connect(self._on_apply_curve)
+        curve_btn_row.addWidget(self.apply_curve_btn)
+        fan_layout.addLayout(curve_btn_row)
+
+        right_col.addWidget(fan_box, 1)
+
+    def _load_saved_curve(self) -> None:
+        raw_pts = self._cfg.get("custom_curve")
+        if isinstance(raw_pts, list) and len(raw_pts) == 5:
+            try:
+                pts = [(int(p[0]), int(p[1])) for p in raw_pts]
+                self.curve_widget.set_points(pts)
+                self.curve_info_label.setText(f"控制点: {pts}")
+                return
+            except (TypeError, ValueError, IndexError):
+                pass
+        self.curve_widget.set_points(DEFAULT_CUSTOM_POINTS)
+
+    def _persist_config(self) -> None:
+        _save_local_config(
+            {
+                "fahrenheit": self._fahrenheit,
+                "sensor": int(self._sensor),
+                "custom_curve": [list(p) for p in self.curve_widget.points()],
+            },
+            path=self._config_path,
+        )
+
+    def _start_worker(self) -> None:
+        self._worker = TelemetryWorker(self.client, self)
+        self._worker.connected.connect(lambda p: self.port_label.setText(f"已连接: {p}"))
+        self._worker.info_updated.connect(self._on_info_updated)
+        self._worker.status_updated.connect(self._on_status_updated)
+        self._worker.error_occurred.connect(self._on_worker_error)
+        self._worker.start()
+
+    @QtCore.Slot(str)
+    def _on_worker_error(self, message: str) -> None:
+        self.port_label.setText(f"连接异常: {message}")
+
+    @QtCore.Slot(object, str)
+    def _on_info_updated(self, info: PowerInfo | None, sn: str) -> None:
+        self._current_sn = sn
+        if info is None:
+            self.spec_labels["sn"].setText(sn or "--")
+            return
+        self._current_info = info
+        brand = "昆仑 (Kunlun)" if info.brand_family == "kunlun" else info.brand_family.capitalize()
+        self.title_label.setText(f"{brand} {info.model} 数字电源")
+        self.spec_labels["model"].setText(info.model)
+        self.spec_labels["rated"].setText(f"{info.rated_power} W")
+        self.spec_labels["cert"].setText(info.certification_label)
+        self.spec_labels["io_max"].setText(f"{info.rated_input_current} A / {info.rated_output_current} A")
+        self.spec_labels["ac_range"].setText(f"{info.rated_input_low_voltage}V ~ {info.rated_input_high_voltage}V")
+        self.spec_labels["fw"].setText(info.firmware_display)
+        self.spec_labels["vendor"].setText(info.manufacture or "--")
+        self.spec_labels["sn"].setText(sn or "--")
+
+        warranty, badge = format_warranty_badge(info, sn)
+        self.spec_labels["warranty"].setText(warranty)
+        if badge:
+            self.edition_badge.setText(badge)
+            self.edition_badge.setVisible(True)
+        else:
+            self.edition_badge.setVisible(False)
+
+    @QtCore.Slot(object)
+    def _on_status_updated(self, status: PowerStatus) -> None:
+        self._last_status = status
+        self.metric_labels["power"].setText(f"{status.power:.2f} W")
+        self.metric_labels["rpm"].setText(f"{status.fan_speed} RPM")
+        self.metric_labels["ac_v"].setText(f"{status.input_voltage:.1f} V")
+        self.metric_labels["freq"].setText(f"{status.frequency:.1f} Hz")
+        self._update_temp_metric()
+
+        self.rail_labels["v12"].setText(f"{status.voltage_12v:.2f} V")
+        self.rail_labels["v5"].setText(f"{status.voltage_5v:.2f} V")
+        self.rail_labels["v33"].setText(f"{status.voltage_3v3:.2f} V")
+        self.rail_labels["v5sb"].setText(f"{status.voltage_5v_sb:.2f} V")
+
+        fault_txt = f"0x{status.malfunction_code:04x}" + (" (正常)" if status.malfunction_code == 0 else " (异常!)")
+        self.fault_label.setText(f"故障码: {fault_txt}")
+        self.history_chart.append_sample(status)
+
+        if self._pending_mode is not None:
+            if status.mode == self._pending_mode or time.monotonic() > self._mode_grace_until:
+                self._pending_mode = None
+
+        # Match HiMOS auto-sync when hardware completes Clean cycle and exits mode 4.
+        if self._waiting_clean_exit and self._pending_mode is None and status.mode != FanMode.CLEAN:
+            self._waiting_clean_exit = False
+            try:
+                self.client.set_fan_mode(status.mode)
+            except Exception:
+                pass
+
+        if (
+            self._pending_mode is None
+            and status.mode in self.mode_buttons
+            and self.mode_group.checkedId() != int(status.mode)
+        ):
+            self.mode_buttons[status.mode].setChecked(True)
+            self.curve_widget.set_editable(status.mode == FanMode.CUSTOM)
+
+    def _update_temp_metric(self) -> None:
+        if self._last_status is None:
+            return
+        temp_c = self._last_status.selected_temperature(self._sensor)
+        val = _to_display_temp(temp_c, self._fahrenheit)
+        unit = "°F" if self._fahrenheit else "°C"
+        self.metric_labels["temp"].setText(f"{val:.2f} {unit}")
+
+    def _toggle_temp_unit(self) -> None:
+        self._fahrenheit = self.unit_btn.isChecked()
+        self.unit_btn.setText("°F" if self._fahrenheit else "°C")
+        self.curve_widget.set_fahrenheit(self._fahrenheit)
+        self.history_chart.set_fahrenheit(self._fahrenheit)
+        self._update_temp_metric()
+        self._persist_config()
+
+    def _on_sensor_changed(self, sensor_id: int) -> None:
+        self._sensor = TempSensor(sensor_id)
+        self.history_chart.set_sensor(self._sensor)
+        self._update_temp_metric()
+        self._persist_config()
+
+    def _on_refresh_selected(self, index: int) -> None:
+        rate_val = self.refresh_combo.itemData(index)
+        try:
+            self.client.set_refresh_mode(RefreshMode(int(rate_val)))
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "设置失败", str(exc))
+
+    def _on_mode_clicked(self, mode_id: int) -> None:
+        mode = FanMode(mode_id)
+        self._pending_mode = mode
+        self._mode_grace_until = time.monotonic() + 2.5
+        self.curve_widget.set_editable(mode == FanMode.CUSTOM)
+        if mode == FanMode.CLEAN:
+            self._waiting_clean_exit = True
+        try:
+            pts = self.curve_widget.points() if mode == FanMode.CUSTOM else None
+            self.client.set_fan_mode(mode, custom_points=pts)
+        except Exception as exc:
+            self._pending_mode = None
+            QtWidgets.QMessageBox.warning(self, "风扇模式切换失败", str(exc))
+
+    def _on_curve_dragged(self, pts: list) -> None:
+        self.curve_info_label.setText(f"控制点: {pts}")
+        self._persist_config()
+
+    def _on_reset_curve(self) -> None:
+        self.curve_widget.set_points(DEFAULT_CUSTOM_POINTS)
+        self.curve_info_label.setText(f"控制点: {list(DEFAULT_CUSTOM_POINTS)}")
+        self._persist_config()
+
+    def _on_apply_curve(self) -> None:
+        try:
+            pts = self.curve_widget.points()
+            self._pending_mode = FanMode.CUSTOM
+            self._mode_grace_until = time.monotonic() + 2.5
+            self.client.set_fan_curve(pts, switch_to_custom=True)
+            self.mode_buttons[FanMode.CUSTOM].setChecked(True)
+            self.curve_widget.set_editable(True)
+            self._persist_config()
+            self.statusBar().showMessage(f"已应用自定义曲线: {pts}", 3000)
+        except Exception as exc:
+            self._pending_mode = None
+            QtWidgets.QMessageBox.warning(self, "下发曲线失败", str(exc))
+
+    def _on_clear_fault_clicked(self) -> None:
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "确认清除故障码",
+            "确定向电源发送清除锁存故障码指令 (0x1E)？",
+        )
+        if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.client.clear_fault_code()
+            self.statusBar().showMessage("已发送清除故障码指令", 3000)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "指令发送失败", str(exc))
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        if self._worker is not None:
+            self._worker.stop()
+            self._worker.wait(2000)
+        self.client.close()
+        super().closeEvent(event)
+
+
+def launch_gui(port: str | None = None, mock: bool = False) -> int:
+    """Start the PySide6 desktop GUI application."""
+    if os.environ.get("QT_QPA_PLATFORM") is None and os.environ.get("WAYLAND_DISPLAY"):
+        os.environ.setdefault("QT_QPA_PLATFORM", "wayland;xcb")
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv[:1])
+    app.setWindowIcon(QtGui.QIcon(str(Path(__file__).with_name("assets") / "himos-psu.svg")))
+    window = MainWindow(port=port, mock=mock)
+    window.show()
+    return int(app.exec())
+
+
+def main() -> int:
+    port = os.environ.get("HIMOS_PSU_PORT")
+    mock = os.environ.get("HIMOS_PSU_MOCK") == "1"
+    return launch_gui(port=port, mock=mock)

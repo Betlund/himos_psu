@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "himos-psu"
+version = "0.1.0"
+description = "Open-source Linux monitor and fan controller for Segotep / Kunlun HiMOS digital power supplies (e.g. KE-1300P)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+gui = ["PySide6>=6.5"]
+serial = ["pyserial>=3.5"]
+
+[project.scripts]
+himos-psu = "himos_psu.cli:main"
+himos-psu-gui = "himos_psu.gui:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
