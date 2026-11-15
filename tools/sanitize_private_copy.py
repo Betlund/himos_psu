@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Sanitize a *private* checkout so it can be published.
 
-Written for the reverse-engineering copy this public repo was derived from
-(``~/Project/鑫谷电源上位机逆向/himos_psu``), but it works on any directory.
+Takes an explicit directory: it never guesses which checkout you mean, so it
+cannot accidentally rewrite a private tree you did not ask it to touch.
 
 It never needs the real serial number as an argument:
   * any ``SBRC`` + 11 chars serial -> synthetic ``SBRC00000000123``
