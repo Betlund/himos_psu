@@ -1,0 +1,1044 @@
+"""Energy dashboard widgets and tariff editor for the PySide6 GUI."""
+
+from __future__ import annotations
+
+import calendar
+import math
+import time
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Any, Sequence
+
+from PySide6 import QtCore, QtGui, QtWidgets
+
+from .energy import (
+    CN_TOU_PRESET,
+    EnergyStore,
+    TariffPlan,
+    Band,
+    format_duration,
+    format_kwh,
+    format_yuan,
+    local_day_end,
+    local_day_start,
+    parse_band_spec,
+)
+
+BG = "#0d1117"
+PANEL = "#11161d"
+PANEL2 = "#161d26"
+BORDER = "#253040"
+TEXT = "#e6edf3"
+MUTED = "#8b9bb0"
+DIM = "#5d6b7e"
+ACCENT = "#38bdf8"
+ACCENT2 = "#7dd3fc"
+ORANGE = "#fb923c"
+GREEN = "#4ade80"
+PURPLE = "#a78bfa"
+RED = "#f87171"
+
+BAND_COLORS = (ACCENT, PURPLE, ORANGE, RED, GREEN, ACCENT2)
+
+CARD_QSS = f"""
+QFrame#card {{ background: {PANEL}; border: 1px solid {BORDER}; border-radius: 10px; }}
+QLabel#kpiTitle {{ color: {MUTED}; font-size: 11px; }}
+QLabel#kpiValue {{ color: {ACCENT}; font-size: 24px; font-weight: bold; }}
+QLabel#kpiSub {{ color: {DIM}; font-size: 10px; }}
+QTableWidget {{ background: transparent; border: none; gridline-color: #1e2836; }}
+QHeaderView::section {{ background: {PANEL2}; color: {MUTED}; border: none; padding: 4px 6px; }}
+QTableWidget::item {{ color: {TEXT}; padding: 2px 4px; }}
+QTabWidget::pane {{ border: 1px solid {BORDER}; border-radius: 10px; top: -1px; }}
+QTabBar::tab {{ background: transparent; color: {MUTED}; padding: 7px 18px; margin-right: 4px;
+                border: 1px solid transparent; border-top-left-radius: 8px; border-top-right-radius: 8px; }}
+QTabBar::tab:selected {{ background: {PANEL}; color: {ACCENT}; border-color: {BORDER}; border-bottom-color: {PANEL}; }}
+QTabBar::tab:hover {{ color: {TEXT}; }}
+"""
+
+
+# --------------------------------------------------------------------------- widgets
+class Card(QtWidgets.QFrame):
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("card")
+
+
+class KpiCard(Card):
+    def __init__(self, title: str, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setSpacing(2)
+        self.title = QtWidgets.QLabel(title)
+        self.title.setObjectName("kpiTitle")
+        layout.addWidget(self.title)
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(6)
+        self.value = QtWidgets.QLabel("--")
+        self.value.setObjectName("kpiValue")
+        self.unit = QtWidgets.QLabel("")
+        self.unit.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        row.addWidget(self.value, 0, QtCore.Qt.AlignmentFlag.AlignBottom)
+        row.addWidget(self.unit, 0, QtCore.Qt.AlignmentFlag.AlignBottom)
+        row.addStretch(1)
+        layout.addLayout(row)
+        self.sub = QtWidgets.QLabel("--")
+        self.sub.setObjectName("kpiSub")
+        layout.addWidget(self.sub)
+
+    def set(self, value: str, unit: str = "", sub: str = "", color: str = ACCENT) -> None:
+        self.value.setText(value)
+        self.unit.setText(unit)
+        self.sub.setText(sub)
+        self.value.setStyleSheet(f"color: {color}; font-size: 24px; font-weight: bold;")
+
+
+class PowerChart(QtWidgets.QWidget):
+    """Area chart of measured power (W) or daily energy (kWh)."""
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setMinimumHeight(190)
+        self._values: list[float | None] = []
+        self._labels: list[str] = []
+        self._unit = "W"
+        self._caption = ""
+        self._peak_prefix = "峰值"
+
+    def set_data(self, values: Sequence[float | None], labels: Sequence[str], unit: str = "W",
+                 caption: str = "", peak_prefix: str = "峰值") -> None:
+        self._values = list(values)
+        self._labels = list(labels)
+        self._unit = unit
+        self._caption = caption
+        self._peak_prefix = peak_prefix
+        self.update()
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+        del event
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        p.fillRect(self.rect(), QtGui.QColor(BG))
+
+        pad_l, pad_r, pad_t, pad_b = 48, 14, 26, 26
+        plot = QtCore.QRectF(pad_l, pad_t, max(60.0, self.width() - pad_l - pad_r),
+                             max(50.0, self.height() - pad_t - pad_b))
+        values = [v for v in self._values if v is not None]
+        if not values:
+            p.setPen(QtGui.QColor(MUTED))
+            p.drawText(self.rect(), QtCore.Qt.AlignmentFlag.AlignCenter, "暂无采集数据")
+            return
+
+        vmax = max(values)
+        if self._unit == "W":
+            step = 50.0 if vmax <= 500 else (100.0 if vmax <= 2000 else 500.0)
+            top = max(step, math.ceil(vmax * 1.15 / step) * step)
+        else:
+            step = 0.5 if vmax <= 5 else (1.0 if vmax <= 20 else 5.0)
+            top = max(step, math.ceil(vmax * 1.15 / step) * step)
+
+        for i in range(4):
+            gy = plot.bottom() - (i / 3.0) * plot.height()
+            p.setPen(QtGui.QPen(QtGui.QColor(BORDER), 1, QtCore.Qt.PenStyle.DashLine))
+            p.drawLine(QtCore.QPointF(plot.left(), gy), QtCore.QPointF(plot.right(), gy))
+            label = f"{top * i / 3:.1f}" if self._unit != "W" else f"{top * i / 3:.0f}"
+            p.setFont(QtGui.QFont("", 7))
+            p.setPen(QtGui.QColor(DIM))
+            p.drawText(QtCore.QRectF(2, gy - 8, pad_l - 8, 16),
+                       QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter, label)
+
+        count = len(self._values)
+        width = plot.width() / max(1, count - 1) if count > 1 else plot.width()
+        points: list[QtCore.QPointF | None] = []
+        for idx, value in enumerate(self._values):
+            if value is None:
+                points.append(None)
+                continue
+            x = plot.left() + idx * width
+            y = plot.bottom() - (value / top) * plot.height()
+            points.append(QtCore.QPointF(x, y))
+
+        # area fill per contiguous run so gaps stay visibly empty
+        run: list[QtCore.QPointF] = []
+        runs: list[list[QtCore.QPointF]] = []
+        for pt in points:
+            if pt is None:
+                if run:
+                    runs.append(run)
+                    run = []
+            else:
+                run.append(pt)
+        if run:
+            runs.append(run)
+        for seg in runs:
+            if len(seg) < 2:
+                continue
+            area = QtGui.QPainterPath()
+            area.moveTo(seg[0].x(), plot.bottom())
+            for pt in seg:
+                area.lineTo(pt)
+            area.lineTo(seg[-1].x(), plot.bottom())
+            area.closeSubpath()
+            grad = QtGui.QLinearGradient(0, plot.top(), 0, plot.bottom())
+            c_top = QtGui.QColor(ACCENT)
+            c_top.setAlpha(110)
+            c_bottom = QtGui.QColor(ACCENT)
+            c_bottom.setAlpha(6)
+            grad.setColorAt(0.0, c_top)
+            grad.setColorAt(1.0, c_bottom)
+            p.fillPath(area, QtGui.QBrush(grad))
+            p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+            p.setPen(QtGui.QPen(QtGui.QColor(ACCENT2), 2.0))
+            p.drawPolyline(QtGui.QPolygonF(seg))
+
+        if values:
+            peak = max(values)
+            peak_idx = max(range(count), key=lambda i: self._values[i] if self._values[i] is not None else -1)
+            if points[peak_idx] is not None:
+                px = points[peak_idx]
+                p.setPen(QtGui.QPen(QtGui.QColor(ORANGE), 1, QtCore.Qt.PenStyle.DashLine))
+                p.drawLine(QtCore.QPointF(px.x(), px.y()), QtCore.QPointF(px.x(), plot.bottom()))
+                p.setPen(QtGui.QPen(QtGui.QColor(BG), 2))
+                p.setBrush(QtGui.QColor(ORANGE))
+                p.drawEllipse(px, 4.0, 4.0)
+                p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+                label = (f"{self._peak_prefix} {peak:.0f} {self._unit}" if self._unit == "W"
+                         else f"{self._peak_prefix} {peak:.2f} {self._unit}")
+                p.setFont(QtGui.QFont("", 8))
+                p.setPen(QtGui.QColor(ORANGE))
+                tx = min(max(plot.left(), px.x() - 70), plot.right() - 130)
+                ty = max(plot.top(), px.y() - 20)
+                p.drawText(QtCore.QRectF(tx, ty, 130, 16), QtCore.Qt.AlignmentFlag.AlignLeft, label)
+
+        if self._labels:
+            step_idx = max(1, len(self._labels) // 7)
+            for idx in range(0, len(self._labels), step_idx):
+                x = plot.left() + idx * width
+                p.setFont(QtGui.QFont("", 7))
+                p.setPen(QtGui.QColor(DIM))
+                p.drawText(QtCore.QRectF(x - 20, plot.bottom() + 4, 40, 14),
+                           QtCore.Qt.AlignmentFlag.AlignHCenter | QtCore.Qt.AlignmentFlag.AlignTop,
+                           self._labels[idx])
+
+        if self._caption:
+            p.setFont(QtGui.QFont("", 8))
+            p.setPen(QtGui.QColor(DIM))
+            p.drawText(QtCore.QRectF(pad_l, 4, self.width() - pad_l - pad_r, 16),
+                       QtCore.Qt.AlignmentFlag.AlignLeft, self._caption)
+
+
+class SplitDonut(QtWidgets.QWidget):
+    """Donut of tariff-band shares with legend and centre totals."""
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setMinimumHeight(170)
+        self._slices: list[dict[str, Any]] = []
+        self._center_top = "--"
+        self._center_mid = ""
+        self._center_bottom = ""
+
+    def set_data(self, slices: Sequence[dict[str, Any]], center_top: str, center_mid: str, center_bottom: str) -> None:
+        self._slices = list(slices)
+        self._center_top = center_top
+        self._center_mid = center_mid
+        self._center_bottom = center_bottom
+        self.update()
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+        del event
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        p.fillRect(self.rect(), QtGui.QColor(BG))
+        if not self._slices:
+            p.setPen(QtGui.QColor(MUTED))
+            p.drawText(self.rect(), QtCore.Qt.AlignmentFlag.AlignCenter, "暂无数据")
+            return
+        size = min(150.0, self.height() - 24.0)
+        rect = QtCore.QRectF(16, (self.height() - size) / 2, size, size)
+        start = 90.0
+        for idx, item in enumerate(self._slices):
+            sweep = -float(item["share"]) * 360.0
+            if sweep == 0:
+                continue
+            p.setBrush(QtGui.QColor(BAND_COLORS[idx % len(BAND_COLORS)]))
+            p.setPen(QtCore.Qt.PenStyle.NoPen)
+            p.drawPie(rect, int(start * 16), int(sweep * 16))
+            start += sweep
+        inner = rect.adjusted(size * 0.27, size * 0.27, -size * 0.27, -size * 0.27)
+        p.setBrush(QtGui.QColor(PANEL))
+        p.drawEllipse(inner)
+        p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+
+        p.setPen(QtGui.QColor(TEXT))
+        p.setFont(QtGui.QFont("", 15, QtGui.QFont.Weight.Bold))
+        p.drawText(QtCore.QRectF(inner.x(), inner.y() + 8, inner.width(), 24),
+                   QtCore.Qt.AlignmentFlag.AlignHCenter, self._center_top)
+        p.setFont(QtGui.QFont("", 8))
+        p.setPen(QtGui.QColor(MUTED))
+        p.drawText(QtCore.QRectF(inner.x(), inner.y() + 32, inner.width(), 14),
+                   QtCore.Qt.AlignmentFlag.AlignHCenter, self._center_mid)
+        p.setPen(QtGui.QColor(ORANGE))
+        p.drawText(QtCore.QRectF(inner.x(), inner.y() + 48, inner.width(), 14),
+                   QtCore.Qt.AlignmentFlag.AlignHCenter, self._center_bottom)
+
+        lx = rect.right() + 22
+        for idx, item in enumerate(self._slices):
+            ly = 18 + idx * 26
+            if ly > self.height() - 16:
+                break
+            p.setBrush(QtGui.QColor(BAND_COLORS[idx % len(BAND_COLORS)]))
+            p.setPen(QtCore.Qt.PenStyle.NoPen)
+            p.drawRoundedRect(QtCore.QRectF(lx, ly + 4, 9, 9), 2, 2)
+            p.setPen(QtGui.QColor(TEXT))
+            p.setFont(QtGui.QFont("", 9))
+            p.drawText(QtCore.QRectF(lx + 16, ly, 40, 18), QtCore.Qt.AlignmentFlag.AlignLeft, str(item["name"]))
+            p.setPen(QtGui.QColor(MUTED))
+            p.setFont(QtGui.QFont("", 9))
+            p.drawText(QtCore.QRectF(lx + 56, ly, 90, 18), QtCore.Qt.AlignmentFlag.AlignLeft,
+                       f"{item['kwh']:.2f} kWh")
+            p.drawText(QtCore.QRectF(lx + 140, ly, 52, 18),
+                       QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter,
+                       f"{item['share'] * 100:.0f}%")
+
+
+class CalendarHeat(QtWidgets.QWidget):
+    """Month calendar with per-day energy intensity."""
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setMinimumHeight(180)
+        self._year = date.today().year
+        self._month = date.today().month
+        self._values: dict[int, float] = {}
+
+    def set_month(self, year: int, month: int, values: dict[int, float]) -> None:
+        self._year, self._month, self._values = year, month, values
+        self.update()
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+        del event
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        p.fillRect(self.rect(), QtGui.QColor(BG))
+        days = calendar.monthrange(self._year, self._month)[1]
+        offset = date(self._year, self._month, 1).weekday()  # Monday == 0
+        rows = (offset + days + 6) // 7
+        cell_w = (self.width() - 6 * 4) / 7.0
+        cell_h = (self.height() - 18 - (rows - 1) * 4) / rows
+        p.setFont(QtGui.QFont("", 7))
+        for col, name in enumerate("一二三四五六日"):
+            p.setPen(QtGui.QColor(DIM))
+            p.drawText(QtCore.QRectF(col * (cell_w + 4), 0, cell_w, 14),
+                       QtCore.Qt.AlignmentFlag.AlignHCenter, name)
+        vmax = max(self._values.values()) if self._values else 1.0
+        today = date.today()
+        for day in range(1, days + 1):
+            index = offset + day - 1
+            row, col = divmod(index, 7)
+            x = col * (cell_w + 4)
+            y = 18 + row * (cell_h + 4)
+            value = self._values.get(day, 0.0)
+            if value > 0:
+                t = (value / vmax) ** 0.85
+                color = QtGui.QColor.fromRgbF(
+                    0.086 + t * 0.14,
+                    0.196 + t * 0.55,
+                    0.290 + t * 0.69,
+                )
+                text_color = BG if t > 0.5 else "#dbeafe"
+            else:
+                color = QtGui.QColor(PANEL2)
+                text_color = DIM
+            p.setBrush(color)
+            p.setPen(QtCore.Qt.PenStyle.NoPen)
+            p.drawRoundedRect(QtCore.QRectF(x, y, cell_w, cell_h), 3, 3)
+            if (self._year, self._month, day) == (today.year, today.month, today.day):
+                p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+                p.setPen(QtGui.QPen(QtGui.QColor(ACCENT2), 1.2))
+                p.drawRoundedRect(QtCore.QRectF(x + 0.5, y + 0.5, cell_w - 1, cell_h - 1), 3, 3)
+            p.setFont(QtGui.QFont("", 8))
+            p.setPen(QtGui.QColor(text_color))
+            p.drawText(QtCore.QRectF(x + 4, y, cell_w - 8, cell_h),
+                       QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter, str(day))
+
+
+class LoadBars(QtWidgets.QWidget):
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setMinimumHeight(150)
+        self._rows: list[dict[str, Any]] = []
+        self._note = ""
+
+    def set_data(self, rows: Sequence[dict[str, Any]], note: str) -> None:
+        self._rows = list(rows)
+        self._note = note
+        self.update()
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+        del event
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        p.fillRect(self.rect(), QtGui.QColor(BG))
+        if not self._rows:
+            return
+        row_h = min(24.0, (self.height() - 20) / max(1, len(self._rows)))
+        for idx, row in enumerate(self._rows):
+            y = idx * row_h
+            p.setFont(QtGui.QFont("", 8))
+            p.setPen(QtGui.QColor(MUTED))
+            p.drawText(QtCore.QRectF(0, y, 54, row_h), QtCore.Qt.AlignmentFlag.AlignVCenter, row["label"])
+            track = QtCore.QRectF(58, y + row_h / 2 - 4, max(40.0, self.width() - 130), 8)
+            p.setBrush(QtGui.QColor(PANEL2))
+            p.setPen(QtCore.Qt.PenStyle.NoPen)
+            p.drawRoundedRect(track, 4, 4)
+            p.setBrush(QtGui.QColor(BAND_COLORS[idx % len(BAND_COLORS)]))
+            p.drawRoundedRect(QtCore.QRectF(track.x(), track.y(), max(4.0, track.width() * row["share"]), 8), 4, 4)
+            p.setPen(QtGui.QColor(TEXT))
+            p.drawText(QtCore.QRectF(self.width() - 58, y, 54, row_h),
+                       QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter,
+                       f"{row['share'] * 100:.0f}%")
+        p.setFont(QtGui.QFont("", 7))
+        p.setPen(QtGui.QColor(DIM))
+        p.drawText(QtCore.QRectF(0, self.height() - 16, self.width(), 14),
+                   QtCore.Qt.AlignmentFlag.AlignLeft, self._note)
+
+
+# --------------------------------------------------------------------------- tariff dialog
+class TariffDialog(QtWidgets.QDialog):
+    """Create/edit a tariff plan (fixed or time-of-use) and optionally recalc history."""
+
+    def __init__(self, store: EnergyStore, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.store = store
+        self.setWindowTitle("电价方案")
+        self.resize(560, 460)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        form = QtWidgets.QFormLayout()
+        self.name_edit = QtWidgets.QLineEdit()
+        self.kind_combo = QtWidgets.QComboBox()
+        self.kind_combo.addItem("固定电价（元/kWh）", "fixed")
+        self.kind_combo.addItem("峰谷分时（尖/峰/平/谷）", "tou")
+        self.price_spin = QtWidgets.QDoubleSpinBox()
+        self.price_spin.setDecimals(3)
+        self.price_spin.setRange(0.0, 20.0)
+        self.price_spin.setSingleStep(0.01)
+        self.price_spin.setValue(0.55)
+        form.addRow("方案名称", self.name_edit)
+        form.addRow("计费方式", self.kind_combo)
+        form.addRow("固定单价", self.price_spin)
+        layout.addLayout(form)
+
+        self.table = QtWidgets.QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["开始", "结束", "时段名", "单价"])
+        self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.table.verticalHeader().setVisible(False)
+        layout.addWidget(QtWidgets.QLabel("峰谷时段（必须从 00:00 连续覆盖到 24:00）"))
+        layout.addWidget(self.table, 1)
+
+        row = QtWidgets.QHBoxLayout()
+        self.add_btn = QtWidgets.QPushButton("添加时段")
+        self.del_btn = QtWidgets.QPushButton("删除选中")
+        self.preset_btn = QtWidgets.QPushButton("载入示例峰谷")
+        self.add_btn.clicked.connect(self._add_row)
+        self.del_btn.clicked.connect(self._del_row)
+        self.preset_btn.clicked.connect(self._load_preset)
+        row.addWidget(self.add_btn)
+        row.addWidget(self.del_btn)
+        row.addWidget(self.preset_btn)
+        row.addStretch(1)
+        layout.addLayout(row)
+
+        self.recalc_check = QtWidgets.QCheckBox("保存后按新电价重算历史费用")
+        self.recalc_check.setChecked(True)
+        layout.addWidget(self.recalc_check)
+
+        note = QtWidgets.QLabel("价格为示例默认值，请按当地居民峰谷/阶梯电价填写；本工具只做价格计算，不联网查询。")
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color: {DIM}; font-size: 10px;")
+        layout.addWidget(note)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Save | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._save)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.kind_combo.currentIndexChanged.connect(self._sync_mode)
+        self._load_plan(store.active_plan())
+        self._sync_mode()
+
+    # -- helpers -----------------------------------------------------------
+    def _load_plan(self, plan: TariffPlan | None) -> None:
+        plan = plan or TariffPlan(name="我的电价", kind="fixed", price=0.55,
+                                  effective_from=date.today().isoformat())
+        self.name_edit.setText(plan.name)
+        self.kind_combo.setCurrentIndex(1 if plan.is_tou else 0)
+        self.price_spin.setValue(plan.price or 0.55)
+        self.table.setRowCount(0)
+        for band in plan.bands:
+            self._append_row(f"{band.start_min // 60:02d}:{band.start_min % 60:02d}",
+                             f"{band.end_min // 60:02d}:{band.end_min % 60:02d}",
+                             band.name, band.price)
+
+    def _append_row(self, start: str, end: str, name: str, price: float) -> None:
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        for col, text in enumerate((start, end, name, f"{price:.3f}")):
+            item = QtWidgets.QTableWidgetItem(str(text))
+            item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(row, col, item)
+
+    def _add_row(self) -> None:
+        self._append_row("00:00", "24:00", "平", 0.55)
+
+    def _del_row(self) -> None:
+        row = self.table.currentRow()
+        if row >= 0:
+            self.table.removeRow(row)
+
+    def _load_preset(self) -> None:
+        self.kind_combo.setCurrentIndex(1)
+        self.table.setRowCount(0)
+        for band in parse_band_spec(CN_TOU_PRESET):
+            self._append_row(f"{band.start_min // 60:02d}:{band.start_min % 60:02d}",
+                             f"{band.end_min // 60:02d}:{band.end_min % 60:02d}",
+                             band.name, band.price)
+
+    def _sync_mode(self) -> None:
+        tou = self.kind_combo.currentData() == "tou"
+        self.price_spin.setEnabled(not tou)
+        self.table.setEnabled(tou)
+        for widget in (self.add_btn, self.del_btn, self.preset_btn):
+            widget.setEnabled(tou)
+
+    def _collect_bands(self) -> tuple[Band, ...]:
+        bands: list[Band] = []
+        for row in range(self.table.rowCount()):
+            try:
+                start_text = self.table.item(row, 0).text().strip()
+                end_text = self.table.item(row, 1).text().strip()
+                name = self.table.item(row, 2).text().strip() or "平"
+                price = float(self.table.item(row, 3).text().strip())
+            except (AttributeError, ValueError) as exc:
+                raise ValueError(f"第 {row + 1} 行格式不正确") from exc
+            bands.append(Band(parse_hm(start_text), parse_hm(end_text), name, price))
+        return tuple(bands)
+
+    def _save(self) -> None:
+        kind = self.kind_combo.currentData()
+        try:
+            if kind == "tou":
+                plan = TariffPlan(name=self.name_edit.text().strip() or "峰谷方案", kind="tou",
+                                  bands=self._collect_bands(), effective_from=date.today().isoformat())
+                from .energy import validate_bands
+
+                validate_bands(plan.bands)
+            else:
+                plan = TariffPlan(name=self.name_edit.text().strip() or "固定电价", kind="fixed",
+                                  price=self.price_spin.value(), effective_from=date.today().isoformat())
+            self.store.set_plan(plan)
+            if self.recalc_check.isChecked():
+                self.store.recalc_costs()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "保存失败", str(exc))
+            return
+        self.accept()
+
+
+def parse_hm(text: str) -> int:
+    parts = text.split(":")
+    if len(parts) != 2:
+        raise ValueError(f"时间格式应为 HH:MM，收到 {text!r}")
+    hour, minute = int(parts[0]), int(parts[1])
+    if hour == 24 and minute == 0:
+        return 1440
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError(f"时间越界：{text!r}")
+    return hour * 60 + minute
+
+
+# --------------------------------------------------------------------------- energy tab
+class EnergyTab(QtWidgets.QWidget):
+    def __init__(self, db_path: str | Path, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.db_path = Path(db_path)
+        self._store: EnergyStore | None = None
+        self._rated_w = 1300.0
+        self._state = "未启动"
+        self._cal_year = date.today().year
+        self._cal_month = date.today().month
+        self._range = "today"
+        self._build()
+        self._open()
+        self._timer = QtCore.QTimer(self)
+        self._timer.timeout.connect(self.refresh)
+        self._timer.start(5000)
+        self.refresh()
+
+    # -- construction ------------------------------------------------------
+    def _build(self) -> None:
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(10, 8, 10, 8)
+        root.setSpacing(8)
+
+        kpis = QtWidgets.QHBoxLayout()
+        kpis.setSpacing(8)
+        self.kpi_today = KpiCard("今日用电")
+        self.kpi_month = KpiCard("本月用电")
+        self.kpi_total = KpiCard("累计用电")
+        self.kpi_runtime = KpiCard("今日运行")
+        for card in (self.kpi_today, self.kpi_month, self.kpi_total, self.kpi_runtime):
+            kpis.addWidget(card, 1)
+        root.addLayout(kpis)
+
+        middle = QtWidgets.QHBoxLayout()
+        middle.setSpacing(8)
+        chart_card = Card()
+        chart_layout = QtWidgets.QVBoxLayout(chart_card)
+        chart_layout.setContentsMargins(12, 8, 10, 8)
+        head = QtWidgets.QHBoxLayout()
+        title = QtWidgets.QLabel("用电曲线")
+        title.setStyleSheet(f"color: {TEXT}; font-weight: bold;")
+        head.addWidget(title)
+        self.range_combo = QtWidgets.QComboBox()
+        self.range_combo.addItem("今日（每小时平均功率）", "today")
+        self.range_combo.addItem("近 7 天（每日电量）", "week")
+        self.range_combo.addItem("近 30 天（每日电量）", "month")
+        self.range_combo.currentIndexChanged.connect(self._on_range_changed)
+        head.addWidget(self.range_combo)
+        head.addStretch(1)
+        chart_layout.addLayout(head)
+        self.chart = PowerChart()
+        chart_layout.addWidget(self.chart, 1)
+        middle.addWidget(chart_card, 3)
+
+        donut_card = Card()
+        donut_layout = QtWidgets.QVBoxLayout(donut_card)
+        donut_layout.setContentsMargins(12, 8, 10, 8)
+        donut_title = QtWidgets.QLabel("本月分时段用电")
+        donut_title.setStyleSheet(f"color: {TEXT}; font-weight: bold;")
+        donut_layout.addWidget(donut_title)
+        self.donut = SplitDonut()
+        donut_layout.addWidget(self.donut, 1)
+        self.band_note = QtWidgets.QLabel("")
+        self.band_note.setStyleSheet(f"color: {DIM}; font-size: 10px;")
+        donut_layout.addWidget(self.band_note)
+        middle.addWidget(donut_card, 2)
+        root.addLayout(middle, 3)
+
+        bottom = QtWidgets.QHBoxLayout()
+        bottom.setSpacing(8)
+
+        cal_card = Card()
+        cal_layout = QtWidgets.QVBoxLayout(cal_card)
+        cal_layout.setContentsMargins(12, 8, 10, 8)
+        cal_head = QtWidgets.QHBoxLayout()
+        cal_title = QtWidgets.QLabel("本月用电日历")
+        cal_title.setStyleSheet(f"color: {TEXT}; font-weight: bold;")
+        cal_head.addWidget(cal_title)
+        cal_head.addStretch(1)
+        self.cal_prev = QtWidgets.QPushButton("‹")
+        self.cal_next = QtWidgets.QPushButton("›")
+        for btn in (self.cal_prev, self.cal_next):
+            btn.setFixedWidth(26)
+            btn.setStyleSheet(f"QPushButton {{ color: {MUTED}; background: transparent; border: 1px solid {BORDER};"
+                              " border-radius: 5px; }")
+        self.cal_prev.clicked.connect(lambda: self._shift_month(-1))
+        self.cal_next.clicked.connect(lambda: self._shift_month(1))
+        cal_head.addWidget(self.cal_prev)
+        cal_head.addWidget(self.cal_next)
+        cal_layout.addLayout(cal_head)
+        self.calendar = CalendarHeat()
+        cal_layout.addWidget(self.calendar, 1)
+        self.cal_note = QtWidgets.QLabel("")
+        self.cal_note.setStyleSheet(f"color: {DIM}; font-size: 10px;")
+        cal_layout.addWidget(self.cal_note)
+        bottom.addWidget(cal_card, 3)
+
+        load_card = Card()
+        load_layout = QtWidgets.QVBoxLayout(load_card)
+        load_layout.setContentsMargins(12, 8, 10, 8)
+        load_title = QtWidgets.QLabel("负载率分布（本月）")
+        load_title.setStyleSheet(f"color: {TEXT}; font-weight: bold;")
+        load_layout.addWidget(load_title)
+        self.load_bars = LoadBars()
+        load_layout.addWidget(self.load_bars, 1)
+        bottom.addWidget(load_card, 2)
+
+        sess_card = Card()
+        sess_layout = QtWidgets.QVBoxLayout(sess_card)
+        sess_layout.setContentsMargins(12, 8, 10, 8)
+        sess_title = QtWidgets.QLabel("最近供电会话")
+        sess_title.setStyleSheet(f"color: {TEXT}; font-weight: bold;")
+        sess_layout.addWidget(sess_title)
+        self.sessions = QtWidgets.QTableWidget(0, 4)
+        self.sessions.setHorizontalHeaderLabels(["时间", "时长", "用电", "费用"])
+        header = self.sessions.horizontalHeader()
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        for col in (1, 2, 3):
+            header.setSectionResizeMode(col, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.sessions.verticalHeader().setVisible(False)
+        self.sessions.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.sessions.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+        sess_layout.addWidget(self.sessions, 1)
+        bottom.addWidget(sess_card, 2)
+        root.addLayout(bottom, 3)
+
+        footer = QtWidgets.QHBoxLayout()
+        self.status_label = QtWidgets.QLabel("")
+        self.status_label.setStyleSheet(f"color: {DIM}; font-size: 10px;")
+        footer.addWidget(self.status_label, 1)
+        self.export_btn = QtWidgets.QToolButton()
+        self.export_btn.setText("导出 CSV")
+        self.export_btn.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
+        menu = QtWidgets.QMenu(self.export_btn)
+        for label, kind in (("分钟明细", "minute"), ("每日汇总", "daily"), ("原始样本", "samples"),
+                            ("供电会话", "sessions")):
+            action = menu.addAction(label)
+            action.triggered.connect(lambda _=False, k=kind: self._export(k))
+        self.export_btn.setMenu(menu)
+        footer.addWidget(self.export_btn)
+        self.tariff_btn = QtWidgets.QPushButton("电价设置")
+        self.tariff_btn.clicked.connect(self._open_tariff)
+        footer.addWidget(self.tariff_btn)
+        root.addLayout(footer)
+
+    # -- store -------------------------------------------------------------
+    def _open(self) -> None:
+        try:
+            self._store = EnergyStore(self.db_path, create=False)
+        except Exception:
+            self._store = None
+
+    def set_info(self, info: Any) -> None:
+        rated = getattr(info, "rated_power", 0) if info is not None else 0
+        if rated:
+            self._rated_w = float(rated)
+
+    def set_collector_state(self, text: str) -> None:
+        self._state = text
+        self.refresh()
+
+    # -- refresh -----------------------------------------------------------
+    def refresh(self) -> None:
+        if self._store is None:
+            self._open()
+        if self._store is None:
+            self.status_label.setText("尚未采集：运行 `himos-psu collect` 或保持 GUI 打开以开始记录")
+            return
+        try:
+            self._refresh_kpis()
+            self._refresh_chart()
+            self._refresh_donut()
+            self._refresh_calendar()
+            self._refresh_load()
+            self._refresh_sessions()
+            self._refresh_status()
+        except Exception as exc:  # keep the timer alive; surface the reason
+            self.status_label.setText(f"读取能耗数据失败：{exc}")
+
+    def _today_bounds(self) -> tuple[int, int]:
+        today = date.today()
+        return local_day_start(today), min(local_day_end(today), int(time.time()))
+
+    def _refresh_kpis(self) -> None:
+        assert self._store is not None
+        store = self._store
+        start, end = self._today_bounds()
+        today = store.report("今日", start, end)
+
+        month_start = local_day_start(date.today().replace(day=1))
+        month = store.report("本月", month_start, end)
+
+        first = store.first_ts()
+        total = store.report("累计", local_day_start(datetime.fromtimestamp(first).date()) if first else start, end)
+
+        self.kpi_today.set(format_kwh(today.kwh), "kWh",
+                           f"费用 {format_yuan(today.cost_cents)} · 平均 {today.avg_w:.0f} W")
+        days_in_month = calendar.monthrange(date.today().year, date.today().month)[1]
+        day_of_month = max(1, date.today().day)
+        projected = month.cost_yuan / day_of_month * days_in_month if month.kwh > 0 else 0.0
+        self.kpi_month.set(format_kwh(month.kwh), "kWh",
+                           f"已用 {format_yuan(month.cost_cents)} · 预估月账单 ¥{projected:.2f}", ACCENT2)
+        since = datetime.fromtimestamp(first).strftime("%Y-%m-%d") if first else "尚未开始"
+        self.kpi_total.set(format_kwh(total.kwh), "kWh", f"自 {since} 起", PURPLE)
+        peak_ratio = (today.peak_w / self._rated_w * 100.0) if self._rated_w else 0.0
+        active = store.active_seconds(start, end)
+        self.kpi_runtime.set(format_duration(active), "",
+                             f"峰值 {today.peak_w:.0f} W · 峰值负载 {peak_ratio:.1f}%", GREEN)
+        self.kpi_runtime.setToolTip("统计功率高于 20 W 的时长，区别于单纯的采集覆盖时长")
+
+    def _refresh_chart(self) -> None:
+        assert self._store is not None
+        store = self._store
+        today = date.today()
+        if self._range == "today":
+            values = store.hourly_watts(today)
+            self.chart.set_data(values, [f"{h:02d}" for h in range(24)], "W",
+                                "每小时平均功率，缺口留空", peak_prefix="小时均值峰值")
+        else:
+            days = 6 if self._range == "week" else 29
+            series = store.daily_series(today - timedelta(days=days), today)
+            values = [item["kwh"] for item in series]
+            labels = [item["date"].strftime("%m-%d") for item in series]
+            self.chart.set_data(values, labels, "kWh", "每日电量，未采集的日期为 0",
+                                peak_prefix="单日峰值")
+
+    def _refresh_donut(self) -> None:
+        assert self._store is not None
+        store = self._store
+        start = local_day_start(date.today().replace(day=1))
+        end = min(local_day_end(date.today()), int(time.time()))
+        bands = store.band_breakdown(start, end)
+        month = store.report("本月", start, end)
+        slices = ([{"name": b["name"], "kwh": b["kwh"], "share": b["share"]} for b in bands]
+                  if month.kwh >= 0.0005 else [])
+        self.donut.set_data(slices, f"{month.kwh:.2f}", "kWh", format_yuan(month.cost_cents))
+        plan = store.active_plan()
+        if plan and plan.is_tou:
+            prices = " · ".join(f"{b.name} {b.price:.2f}" for b in plan.bands)
+            self.band_note.setText(f"当前电价（元/kWh）：{prices}")
+        elif plan:
+            self.band_note.setText(f"当前电价：统一 {plan.price:.3f} 元/kWh")
+
+    def _refresh_calendar(self) -> None:
+        assert self._store is not None
+        values = self._store.calendar(self._cal_year, self._cal_month)
+        self.calendar.set_month(self._cal_year, self._cal_month, values)
+        month_total = sum(values.values())
+        self.cal_note.setText(f"{self._cal_year}-{self._cal_month:02d} 已记录 {len(values)} 天 · "
+                              f"合计 {format_kwh(month_total)} kWh")
+
+    def _refresh_load(self) -> None:
+        assert self._store is not None
+        start = local_day_start(date.today().replace(day=1))
+        end = min(local_day_end(date.today()), int(time.time()))
+        rows = self._store.load_distribution(start, end, self._rated_w)
+        self.load_bars.set_data(rows, f"额定 {self._rated_w:.0f} W · 按每分钟平均功率分档")
+
+    def _refresh_sessions(self) -> None:
+        assert self._store is not None
+        sessions = self._store.recent_sessions(6)
+        self.sessions.setRowCount(len(sessions))
+        for row, item in enumerate(sessions):
+            start = datetime.fromtimestamp(item["start_ts"])
+            end = datetime.fromtimestamp(item["end_ts"])
+            span = f"{start:%m-%d %H:%M}"
+            report = self._store.report("会话", item["start_ts"], item["end_ts"] + 1)
+            values = [span, format_duration(item["duration_s"]), f"{item['kwh']:.2f} kWh",
+                      format_yuan(report.cost_cents)]
+            for col, value in enumerate(values):
+                cell = QtWidgets.QTableWidgetItem(value)
+                cell.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+                if col == 0:
+                    cell.setToolTip(f"{start:%Y-%m-%d %H:%M} → {end:%H:%M}")
+                self.sessions.setItem(row, col, cell)
+
+    def _refresh_status(self) -> None:
+        assert self._store is not None
+        store = self._store
+        last = store.last_sample_ts()
+        when = datetime.fromtimestamp(last).strftime("%H:%M:%S") if last else "--"
+        size_mb = store.db_size() / 1024 / 1024
+        self.status_label.setText(f"采集：{self._state} · 最后样本 {when} · "
+                                  f"样本 {store.sample_count():,} 条 · 数据库 {size_mb:.1f} MB")
+
+    # -- actions -----------------------------------------------------------
+    def _on_range_changed(self, _index: int) -> None:
+        self._range = self.range_combo.currentData()
+        self._refresh_chart()
+
+    def _shift_month(self, delta: int) -> None:
+        month = self._cal_month + delta
+        year = self._cal_year
+        if month < 1:
+            year, month = year - 1, 12
+        elif month > 12:
+            year, month = year + 1, 1
+        self._cal_year, self._cal_month = year, month
+        self._refresh_calendar()
+
+    def _export(self, kind: str) -> None:
+        default = f"himos-energy-{kind}-{date.today():%Y%m%d}.csv"
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "导出 CSV", str(Path.home() / default),
+                                                        "CSV 文件 (*.csv)")
+        if not path:
+            return
+        try:
+            assert self._store is not None
+            rows = self._store.export_csv(kind, path)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "导出失败", str(exc))
+            return
+        self.status_label.setText(f"已导出 {rows} 行 → {path}")
+
+    def _open_tariff(self) -> None:
+        try:
+            store = EnergyStore(self.db_path)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "无法打开数据库", str(exc))
+            return
+        try:
+            dialog = TariffDialog(store, self)
+            if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+                self.refresh()
+        finally:
+            store.close()
+
+
+# --------------------------------------------------------------------------- settings tab
+class SettingsTab(QtWidgets.QWidget):
+    def __init__(self, db_path: str | Path, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.db_path = Path(db_path)
+        self._state = "未启动"
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(12, 10, 12, 10)
+        root.setSpacing(10)
+
+        plan_box = QtWidgets.QGroupBox("电价方案")
+        plan_layout = QtWidgets.QVBoxLayout(plan_box)
+        self.plan_label = QtWidgets.QLabel("--")
+        self.plan_label.setWordWrap(True)
+        plan_layout.addWidget(self.plan_label)
+        plan_buttons = QtWidgets.QHBoxLayout()
+        self.edit_plan_btn = QtWidgets.QPushButton("编辑电价方案")
+        self.recalc_btn = QtWidgets.QPushButton("重算历史费用")
+        self.edit_plan_btn.clicked.connect(self._edit_plan)
+        self.recalc_btn.clicked.connect(self._recalc)
+        plan_buttons.addWidget(self.edit_plan_btn)
+        plan_buttons.addWidget(self.recalc_btn)
+        plan_buttons.addStretch(1)
+        plan_layout.addLayout(plan_buttons)
+        root.addWidget(plan_box)
+
+        carbon_box = QtWidgets.QGroupBox("碳排估算（可选）")
+        carbon_layout = QtWidgets.QHBoxLayout(carbon_box)
+        carbon_layout.addWidget(QtWidgets.QLabel("排放因子"))
+        self.carbon_spin = QtWidgets.QDoubleSpinBox()
+        self.carbon_spin.setDecimals(3)
+        self.carbon_spin.setRange(0.0, 2.0)
+        self.carbon_spin.setSingleStep(0.01)
+        self.carbon_spin.setSuffix(" kgCO₂/kWh")
+        self.carbon_spin.setToolTip("0 表示不显示碳排；中国区域电网平均值常被引用为 0.57 左右，请自行核实")
+        carbon_layout.addWidget(self.carbon_spin)
+        self.carbon_save = QtWidgets.QPushButton("保存")
+        self.carbon_save.clicked.connect(self._save_carbon)
+        carbon_layout.addWidget(self.carbon_save)
+        carbon_layout.addStretch(1)
+        root.addWidget(carbon_box)
+
+        data_box = QtWidgets.QGroupBox("数据管理")
+        data_layout = QtWidgets.QVBoxLayout(data_box)
+        self.data_label = QtWidgets.QLabel("--")
+        self.data_label.setWordWrap(True)
+        data_layout.addWidget(self.data_label)
+        data_buttons = QtWidgets.QHBoxLayout()
+        self.open_dir_btn = QtWidgets.QPushButton("打开数据目录")
+        self.prune_btn = QtWidgets.QPushButton("清理 14 天前原始样本")
+        self.export_all_btn = QtWidgets.QPushButton("导出每日汇总 CSV")
+        self.open_dir_btn.clicked.connect(self._open_dir)
+        self.prune_btn.clicked.connect(self._prune)
+        self.export_all_btn.clicked.connect(self._export_all)
+        for btn in (self.open_dir_btn, self.prune_btn, self.export_all_btn):
+            data_buttons.addWidget(btn)
+        data_buttons.addStretch(1)
+        data_layout.addLayout(data_buttons)
+        root.addWidget(data_box)
+
+        note = QtWidgets.QLabel(
+            "口径说明：统计的是电源输入端功率（不含显示器与外设）；固件不提供输出电流，因此本工具不计算转换效率。"
+            "采样由 PSU 自身的推送间隔决定（1–3 s），断档按缺口记录、不按 0 W 补算。"
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color: {DIM}; font-size: 10px;")
+        root.addWidget(note)
+
+        self.state_label = QtWidgets.QLabel("")
+        self.state_label.setStyleSheet(f"color: {MUTED}; font-size: 10px;")
+        root.addWidget(self.state_label)
+        root.addStretch(1)
+
+        self._timer = QtCore.QTimer(self)
+        self._timer.timeout.connect(self.refresh)
+        self._timer.start(10000)
+        self.refresh()
+
+    def set_collector_state(self, text: str) -> None:
+        self._state = text
+        self.refresh()
+
+    def refresh(self) -> None:
+        store = None
+        try:
+            store = EnergyStore(self.db_path)
+        except Exception as exc:
+            self.plan_label.setText(f"无法打开数据库：{exc}")
+            return
+        try:
+            plan = store.active_plan()
+            self.plan_label.setText(plan.describe() if plan else "尚未设置")
+            self.carbon_spin.setValue(store.carbon_factor)
+            first = store.first_ts()
+            size_mb = store.db_size() / 1024 / 1024
+            self.data_label.setText(
+                f"数据库：{store.path}\n大小 {size_mb:.1f} MB · 原始样本 {store.sample_count():,} 条"
+                f" · 首采 {datetime.fromtimestamp(first).strftime('%Y-%m-%d %H:%M') if first else '尚未开始'}"
+            )
+            self.state_label.setText(f"采集状态：{self._state}")
+        finally:
+            store.close()
+
+    def _edit_plan(self) -> None:
+        store = EnergyStore(self.db_path)
+        try:
+            dialog = TariffDialog(store, self)
+            dialog.exec()
+        finally:
+            store.close()
+        self.refresh()
+
+    def _recalc(self) -> None:
+        store = EnergyStore(self.db_path)
+        try:
+            rows = store.recalc_costs()
+        finally:
+            store.close()
+        QtWidgets.QMessageBox.information(self, "重算完成", f"已按当前电价重算 {rows} 个分钟桶的费用。")
+        self.refresh()
+
+    def _save_carbon(self) -> None:
+        store = EnergyStore(self.db_path)
+        try:
+            store.set_carbon_factor(self.carbon_spin.value())
+        finally:
+            store.close()
+        self.state_label.setText("碳排因子已保存。")
+
+    def _open_dir(self) -> None:
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(self.db_path.parent)))
+
+    def _prune(self) -> None:
+        store = EnergyStore(self.db_path)
+        try:
+            removed = store.prune_raw(14)
+        finally:
+            store.close()
+        QtWidgets.QMessageBox.information(self, "清理完成", f"已删除 {removed} 条原始样本，分钟与日汇总保留。")
+        self.refresh()
+
+    def _export_all(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "导出每日汇总", str(Path.home() / "himos-energy-daily.csv"),
+                                                        "CSV 文件 (*.csv)")
+        if not path:
+            return
+        store = EnergyStore(self.db_path, create=False)
+        try:
+            rows = store.export_csv("daily", path)
+        finally:
+            store.close()
+        QtWidgets.QMessageBox.information(self, "导出完成", f"已导出 {rows} 行 → {path}")

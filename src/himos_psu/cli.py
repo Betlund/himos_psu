@@ -6,9 +6,22 @@ import argparse
 import json
 import sys
 import time
+from datetime import date, datetime, timedelta
 from typing import Sequence
 
 from .client import PowerSupplyClient
+from .collector import Collector, CollectorBusy
+from .energy import (
+    EnergyStore,
+    TariffPlan,
+    fixed_plan,
+    format_kwh,
+    format_yuan,
+    local_day_end,
+    local_day_start,
+    parse_band_spec,
+    preset_plan,
+)
 from .fan_curve import DEFAULT_CUSTOM_POINTS, resample_fan_curve
 from .protocol import (
     FanMode,
@@ -197,6 +210,170 @@ def _cmd_gui(args: argparse.Namespace) -> int:
     return launch_gui(port=args.port, mock=args.mock)
 
 
+
+def _period_bounds(period: str) -> tuple[str, int, int]:
+    """Return (label, start_ts, end_ts) for a named reporting period."""
+    today = date.today()
+    if period == "yesterday":
+        start_day = end_day = today - timedelta(days=1)
+        return "昨日", local_day_start(start_day), local_day_end(end_day)
+    if period == "week":
+        start_day = today - timedelta(days=today.weekday())
+        end_day = today
+    elif period == "month":
+        start_day, end_day = today.replace(day=1), today
+    elif period == "year":
+        start_day, end_day = date(today.year, 1, 1), today
+    else:
+        start_day = end_day = today
+    label = {"today": "今日", "week": "本周", "month": "本月", "year": "今年"}[period]
+    end_ts = min(int(time.time()), local_day_end(end_day))
+    return label, local_day_start(start_day), max(end_ts, local_day_start(start_day))
+
+
+def _print_energy_report(store: EnergyStore, label: str, start_ts: int, end_ts: int,
+                         as_json: bool, rated_w: float = 0.0) -> int:
+    report = store.report(label, start_ts, end_ts)
+    bands = store.band_breakdown(start_ts, end_ts)
+    if as_json:
+        payload = report.as_dict()
+        payload["bands"] = bands
+        payload["db"] = str(store.path)
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    if report.samples == 0:
+        print(f"{label}：该区间没有采集数据。")
+        print("能耗统计依赖采集进程：运行 `himos-psu collect`（或打开 GUI）以开始记录。")
+        return 1
+    span = f"{datetime.fromtimestamp(start_ts):%Y-%m-%d}"
+    if end_ts - start_ts > 86400:
+        span += f" → {datetime.fromtimestamp(end_ts - 1):%Y-%m-%d}"
+    print(f"{label}  {span}")
+    print(f"  用电量    {format_kwh(report.kwh)} kWh")
+    print(f"  电费      {format_yuan(report.cost_cents)}")
+    print(f"  平均功率  {report.avg_w:.0f} W        峰值 {report.peak_w:.0f} W")
+    print(f"  覆盖率    {report.coverage * 100:.1f}%（缺口 {report.gap_s:.0f} s）")
+    if bands:
+        parts = []
+        for item in bands:
+            parts.append(f"{item['name']} {format_kwh(item['kwh'])}kWh {format_yuan(item['cost_yuan'] * 100)} "
+                         f"{item['share'] * 100:.0f}%")
+        print("  分时段    " + " | ".join(parts))
+    if report.carbon_kg:
+        print(f"  碳排      {report.carbon_kg:.2f} kgCO₂")
+    print(f"  数据源    {store.path}")
+    return 0
+
+
+def _cmd_energy_period(args: argparse.Namespace) -> int:
+    label, start_ts, end_ts = _period_bounds(args.period)
+    with EnergyStore(args.db, create=False) as store:
+        return _print_energy_report(store, label, start_ts, end_ts, args.json)
+
+
+def _parse_date(text: str) -> date:
+    return datetime.strptime(text, "%Y-%m-%d").date()
+
+
+def _cmd_energy_report(args: argparse.Namespace) -> int:
+    start_day = _parse_date(args.from_date)
+    end_day = _parse_date(args.to_date)
+    if end_day < start_day:
+        raise ValueError("--to 不能早于 --from")
+    with EnergyStore(args.db, create=False) as store:
+        return _print_energy_report(store, "区间", local_day_start(start_day),
+                                    local_day_end(end_day), args.json)
+
+
+def _cmd_energy_export(args: argparse.Namespace) -> int:
+    start_ts = local_day_start(_parse_date(args.from_date)) if args.from_date else 0
+    end_ts = local_day_end(_parse_date(args.to_date)) if args.to_date else int(time.time()) + 86400
+    with EnergyStore(args.db, create=False) as store:
+        rows = store.export_csv(args.kind, args.out, start_ts, end_ts)
+    if args.out != "-":
+        print(f"已导出 {rows} 行 → {args.out}")
+    return 0
+
+
+def _cmd_energy_prune(args: argparse.Namespace) -> int:
+    with EnergyStore(args.db) as store:
+        removed = store.prune_raw(args.days)
+        print(f"已删除 {removed} 条 {args.days} 天前的原始样本（分钟聚合与日汇总保留）。")
+    return 0
+
+
+def _cmd_tariff_list(args: argparse.Namespace) -> int:
+    with EnergyStore(args.db, create=False) as store:
+        active = store.active_plan()
+        print(f"当前生效: {active.describe() if active else '(无方案)'}")
+        for plan in store.plans()[:12]:
+            marker = "*" if active and plan.plan_id == active.plan_id else " "
+            print(f" {marker} #{plan.plan_id:<3} {plan.describe()}  生效自 {plan.effective_from}")
+        print("\n提示：内置方案价格为示例值，请按当地电价修改：himos-psu tariff set ...")
+    return 0
+
+
+def _cmd_tariff_set(args: argparse.Namespace) -> int:
+    choices = [bool(args.price is not None), bool(args.bands), bool(args.preset)]
+    if sum(choices) != 1:
+        raise ValueError("请指定 --price（固定电价）或 --bands（峰谷时段）或 --preset cn 三者之一")
+    if args.price is not None:
+        plan = fixed_plan(args.name, args.price)
+    elif args.preset:
+        plan = preset_plan(args.name)
+    else:
+        plan = TariffPlan(name=args.name, kind="tou", bands=parse_band_spec(args.bands),
+                          effective_from=date.today().isoformat())
+    with EnergyStore(args.db) as store:
+        stored = store.set_plan(plan)
+        print(f"已保存电价方案: {stored.describe()}")
+        if args.recalc:
+            rows = store.recalc_costs()
+            print(f"已按新电价重算 {rows} 个分钟桶的历史费用。")
+        else:
+            print("历史费用未重算；如需应用新电价请加 --recalc 或运行 `himos-psu tariff recalc`。")
+    return 0
+
+
+def _cmd_tariff_recalc(args: argparse.Namespace) -> int:
+    with EnergyStore(args.db) as store:
+        rows = store.recalc_costs()
+        print(f"已重算 {rows} 个分钟桶的费用（使用当前生效方案）。")
+    return 0
+
+
+def _cmd_collect(args: argparse.Namespace) -> int:
+    store = EnergyStore(args.db)
+    client = PowerSupplyClient(port=args.port, mock=args.mock, verify_crc=not args.no_crc_check)
+    last_report = [time.monotonic()]
+
+    def on_state(text: str) -> None:
+        if not args.quiet:
+            print(f"[{time.strftime('%H:%M:%S')}] {text}", flush=True)
+
+    def on_status(status) -> None:
+        if args.quiet or time.monotonic() - last_report[0] < 15:
+            return
+        last_report[0] = time.monotonic()
+        print(f"[{time.strftime('%H:%M:%S')}] {status.power:.1f} W · 累计 "
+              f"{format_kwh(collector.stats.kwh)} kWh · {collector.stats.samples} 样本"
+              + (f" · 缺口 {collector.stats.gaps} 次" if collector.stats.gaps else ""), flush=True)
+
+    collector = Collector(client, store, on_state=on_state, on_status=on_status)
+    try:
+        collector.run()
+    except KeyboardInterrupt:
+        pass
+    except CollectorBusy as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        store.close()
+    if not args.quiet:
+        print(f"采集结束：{collector.stats.samples} 样本，{format_kwh(collector.stats.kwh)} kWh。")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="himos-psu",
@@ -246,6 +423,49 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_clear = sub.add_parser("clear-fault", help="清除电源锁存故障码 (0x1E)")
     p_clear.set_defaults(func=_cmd_clear_fault)
+
+    p_energy = sub.add_parser("energy", help="查看能耗统计（今日/本周/本月/今年/自定义区间）")
+    p_energy.add_argument("--db", help="能耗数据库路径（默认 ~/.local/share/himos-psu/energy.db）")
+    esub = p_energy.add_subparsers(dest="energy_cmd", required=True)
+    for name, text in (("today", "今日"), ("yesterday", "昨日"), ("week", "本周"),
+                       ("month", "本月"), ("year", "今年")):
+        p_period = esub.add_parser(name, help=f"{text}能耗报告")
+        p_period.add_argument("--json", action="store_true")
+        p_period.set_defaults(func=_cmd_energy_period, period=name)
+    p_report = esub.add_parser("report", help="自定义日期区间的能耗报告")
+    p_report.add_argument("--from", dest="from_date", required=True, metavar="YYYY-MM-DD")
+    p_report.add_argument("--to", dest="to_date", required=True, metavar="YYYY-MM-DD")
+    p_report.add_argument("--json", action="store_true")
+    p_report.set_defaults(func=_cmd_energy_report)
+    p_export = esub.add_parser("export", help="导出 CSV（分钟明细/每日汇总/原始样本/供电会话）")
+    p_export.add_argument("--kind", choices=["minute", "daily", "samples", "sessions"], default="daily")
+    p_export.add_argument("--from", dest="from_date", metavar="YYYY-MM-DD")
+    p_export.add_argument("--to", dest="to_date", metavar="YYYY-MM-DD")
+    p_export.add_argument("--out", default="-", help="输出文件，- 表示标准输出")
+    p_export.set_defaults(func=_cmd_energy_export)
+    p_prune = esub.add_parser("prune", help="清理超过保留期的原始样本（分钟/日汇总保留）")
+    p_prune.add_argument("--days", type=int, default=14)
+    p_prune.set_defaults(func=_cmd_energy_prune)
+
+    p_tariff = sub.add_parser("tariff", help="管理电价方案（固定电价 / 峰谷分时）")
+    p_tariff.add_argument("--db", help="能耗数据库路径")
+    tsub = p_tariff.add_subparsers(dest="tariff_cmd", required=True)
+    p_tl = tsub.add_parser("list", help="列出生效方案与历史方案")
+    p_tl.set_defaults(func=_cmd_tariff_list)
+    p_ts = tsub.add_parser("set", help="新增并启用一个电价方案")
+    p_ts.add_argument("--name", default="自定义方案")
+    p_ts.add_argument("--price", type=float, help="固定电价（元/kWh）")
+    p_ts.add_argument("--bands", help="峰谷时段，如 0-7:谷:0.32,7-10:平:0.58,10-24:峰:0.92")
+    p_ts.add_argument("--preset", choices=["cn"], help="使用内置示例峰谷方案")
+    p_ts.add_argument("--recalc", action="store_true", help="保存后按新电价重算历史费用")
+    p_ts.set_defaults(func=_cmd_tariff_set)
+    p_tr = tsub.add_parser("recalc", help="按当前生效方案重算历史费用")
+    p_tr.set_defaults(func=_cmd_tariff_recalc)
+
+    p_collect = sub.add_parser("collect", help="前台采集能耗数据（Ctrl+C 停止；与 GUI 互斥）")
+    p_collect.add_argument("--db", help="能耗数据库路径")
+    p_collect.add_argument("--quiet", action="store_true", help="不打印进度")
+    p_collect.set_defaults(func=_cmd_collect)
 
     p_udev = sub.add_parser("udev-rule", help="打印无需 root 访问 CH340 串口的 udev 规则示例")
     p_udev.set_defaults(func=lambda _: (sys.stdout.write(UDEV_RULE), 0)[1])

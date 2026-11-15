@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "himos-psu"
-version = "0.1.0"
-description = "Open-source Linux monitor and fan controller for Segotep / Kunlun HiMOS digital power supplies (e.g. KE-1300P)"
+version = "0.2.0"
+description = "Open-source Linux monitor, fan controller and energy tracker for Segotep / Kunlun HiMOS digital power supplies (e.g. KE-1300P)"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []

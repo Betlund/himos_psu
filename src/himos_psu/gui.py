@@ -13,6 +13,8 @@ from typing import Sequence
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from .client import PowerSupplyClient
+from .collector import Collector, CollectorBusy
+from .energy import DEFAULT_DB, EnergyStore
 from .fan_curve import (
     DEFAULT_CUSTOM_POINTS,
     Point,
@@ -20,6 +22,7 @@ from .fan_curve import (
     clamp_dragged_point,
     resample_fan_curve,
 )
+from .gui_energy import CARD_QSS, EnergyTab, SettingsTab
 from .protocol import (
     FanMode,
     PowerInfo,
@@ -309,40 +312,45 @@ class HistoryChartWidget(QtWidgets.QWidget):
 
 
 class TelemetryWorker(QtCore.QThread):
-    """Background serial polling thread keeping UI responsive."""
+    """Background collector thread keeping the UI responsive.
+
+    Runs the same :class:`Collector` as ``himos-psu collect``: it takes the
+    single-collector lock, opens the PSU, integrates energy into SQLite and
+    forwards telemetry to the widgets.
+    """
 
     info_updated = QtCore.Signal(object, str)
     status_updated = QtCore.Signal(object)
     error_occurred = QtCore.Signal(str)
-    connected = QtCore.Signal(str)
+    state_changed = QtCore.Signal(str)
 
-    def __init__(self, client: PowerSupplyClient, parent: QtCore.QObject | None = None) -> None:
+    def __init__(self, client: PowerSupplyClient, db_path: Path, parent: QtCore.QObject | None = None) -> None:
         super().__init__(parent)
         self.client = client
+        self.db_path = Path(db_path)
         self._running = True
 
     def run(self) -> None:
+        store: EnergyStore | None = None
         try:
-            self.client.open()
-            self.connected.emit(self.client.port_name)
-            info, sn = self.client.query_specs_and_sn(timeout=2.0)
-            if info is not None or sn:
-                self.info_updated.emit(info, sn)
+            store = EnergyStore(self.db_path)
+            collector = Collector(
+                self.client,
+                store,
+                on_state=self.state_changed.emit,
+                on_specs=lambda info, sn: self.info_updated.emit(info, sn),
+                on_status=self.status_updated.emit,
+            )
+            collector.run(should_stop=lambda: not self._running)
+        except CollectorBusy as exc:
+            self.error_occurred.emit(str(exc))
+            self.state_changed.emit("串口被其他采集进程占用（历史数据仍可查看）")
         except Exception as exc:
             self.error_occurred.emit(str(exc))
-            return
-
-        while self._running:
-            try:
-                events = self.client.poll_frames(timeout=0.05)
-                for _, parsed in events:
-                    if isinstance(parsed, PowerInfo):
-                        self.info_updated.emit(parsed, self.client.sn)
-                    elif isinstance(parsed, PowerStatus):
-                        self.status_updated.emit(parsed)
-            except Exception as exc:
-                self.error_occurred.emit(str(exc))
-                break
+            self.state_changed.emit("采集已中断")
+        finally:
+            if store is not None:
+                store.close()
 
     def stop(self) -> None:
         self._running = False
@@ -357,11 +365,19 @@ class MainWindow(QtWidgets.QMainWindow):
         mock: bool = False,
         client: PowerSupplyClient | None = None,
         config_path: Path | None = None,
+        db_path: str | Path | None = None,
+        start_collector: bool = True,
     ) -> None:
         super().__init__()
         self._port = port
         self._mock = mock
         self._config_path = config_path or CONFIG_PATH
+        self._db_path = Path(db_path or os.environ.get("HIMOS_PSU_DB") or DEFAULT_DB)
+        self._start_collector = start_collector
+        try:  # make sure the energy tab has a database even before collection starts
+            EnergyStore(self._db_path).close()
+        except Exception:
+            pass
         self.client = client or PowerSupplyClient(port=port, mock=mock)
         self._worker: TelemetryWorker | None = None
         self._cfg = _load_local_config(self._config_path)
@@ -396,6 +412,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QLabel#metricValue { font-size: 22px; font-weight: bold; color: #38bdf8; }
             QLabel#badge { background: #1e293b; border: 1px solid #38bdf8; border-radius: 5px; padding: 2px 8px; color: #7dd3fc; font-weight: bold; }
             """
+            + CARD_QSS
         )
 
     def _build_ui(self) -> None:
@@ -430,9 +447,13 @@ class MainWindow(QtWidgets.QMainWindow):
         header.addWidget(self.unit_btn)
         main_layout.addLayout(header)
 
-        # Body: left spec column + right live dashboard/control column
-        body = QtWidgets.QHBoxLayout()
-        main_layout.addLayout(body, 1)
+        # Body: left spec column + right live dashboard/control column, inside a tab
+        self.tabs = QtWidgets.QTabWidget()
+        self.tabs.setDocumentMode(True)
+        self.realtime_tab = QtWidgets.QWidget()
+        body = QtWidgets.QHBoxLayout(self.realtime_tab)
+        body.setContentsMargins(0, 6, 0, 0)
+        body.setSpacing(10)
 
         # Left column: hardware specs + rails + fault clear
         left_col = QtWidgets.QVBoxLayout()
@@ -576,6 +597,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         right_col.addWidget(fan_box, 1)
 
+        self.energy_tab = EnergyTab(self._db_path)
+        self.settings_tab = SettingsTab(self._db_path)
+        self.tabs.addTab(self.realtime_tab, "实时监控")
+        self.tabs.addTab(self.energy_tab, "能耗统计")
+        self.tabs.addTab(self.settings_tab, "设置")
+        main_layout.addWidget(self.tabs, 1)
+
     def _load_saved_curve(self) -> None:
         raw_pts = self._cfg.get("custom_curve")
         if isinstance(raw_pts, list) and len(raw_pts) == 5:
@@ -599,16 +627,26 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _start_worker(self) -> None:
-        self._worker = TelemetryWorker(self.client, self)
-        self._worker.connected.connect(lambda p: self.port_label.setText(f"已连接: {p}"))
+        if not self._start_collector:
+            self.port_label.setText("状态: 仅查看（未启动采集）")
+            return
+        self._worker = TelemetryWorker(self.client, self._db_path, self)
+        self._worker.state_changed.connect(self._on_collector_state)
         self._worker.info_updated.connect(self._on_info_updated)
         self._worker.status_updated.connect(self._on_status_updated)
         self._worker.error_occurred.connect(self._on_worker_error)
         self._worker.start()
 
     @QtCore.Slot(str)
+    def _on_collector_state(self, text: str) -> None:
+        self.port_label.setText(f"状态: {text}")
+        self.energy_tab.set_collector_state(text)
+        self.settings_tab.set_collector_state(text)
+
+    @QtCore.Slot(str)
     def _on_worker_error(self, message: str) -> None:
         self.port_label.setText(f"连接异常: {message}")
+        self.statusBar().showMessage(message, 8000)
 
     @QtCore.Slot(object, str)
     def _on_info_updated(self, info: PowerInfo | None, sn: str) -> None:
@@ -617,6 +655,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.spec_labels["sn"].setText(sn or "--")
             return
         self._current_info = info
+        self.energy_tab.set_info(info)
         brand = "昆仑 (Kunlun)" if info.brand_family == "kunlun" else info.brand_family.capitalize()
         self.title_label.setText(f"{brand} {info.model} 数字电源")
         self.spec_labels["model"].setText(info.model)
@@ -762,13 +801,14 @@ class MainWindow(QtWidgets.QMainWindow):
         super().closeEvent(event)
 
 
-def launch_gui(port: str | None = None, mock: bool = False) -> int:
+def launch_gui(port: str | None = None, mock: bool = False, db_path: str | Path | None = None,
+               start_collector: bool = True) -> int:
     """Start the PySide6 desktop GUI application."""
     if os.environ.get("QT_QPA_PLATFORM") is None and os.environ.get("WAYLAND_DISPLAY"):
         os.environ.setdefault("QT_QPA_PLATFORM", "wayland;xcb")
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv[:1])
     app.setWindowIcon(QtGui.QIcon(str(Path(__file__).with_name("assets") / "himos-psu.svg")))
-    window = MainWindow(port=port, mock=mock)
+    window = MainWindow(port=port, mock=mock, db_path=db_path, start_collector=start_collector)
     window.show()
     return int(app.exec())
 
@@ -776,4 +816,4 @@ def launch_gui(port: str | None = None, mock: bool = False) -> int:
 def main() -> int:
     port = os.environ.get("HIMOS_PSU_PORT")
     mock = os.environ.get("HIMOS_PSU_MOCK") == "1"
-    return launch_gui(port=port, mock=mock)
+    return launch_gui(port=port, mock=mock, db_path=os.environ.get("HIMOS_PSU_DB"))
