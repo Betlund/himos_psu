@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import time
 import unittest
 from datetime import date
 from pathlib import Path
@@ -87,14 +88,25 @@ class GuiSmokeTestCase(unittest.TestCase):
                 self.assertEqual(pts[3], (80, 80))
 
                 # Seed a little history so the energy tab has something to show.
-                base = local_day_start(date.today())
+                # Timestamps must sit inside today *and* before "now", otherwise the
+                # tab's today range [day start, now] excludes them and the KPI stays
+                # zero — which is exactly what happened on a CI runner running UTC.
+                now = int(time.time())
+                day_start = local_day_start(date.today())
+                first_ts = max(day_start, now - 120)
+                seeded = 0
                 with EnergyStore(tmp / "energy.db") as store:
                     store.set_plan(fixed_plan("测试电价", 0.6))
-                    for i in range(61):
-                        store.add_sample(base + 10 * 3600 + i, status(150.0))
+                    for offset in range(61):
+                        ts = first_ts + offset
+                        if ts >= now:
+                            break
+                        store.add_sample(ts, status(150.0))
+                        seeded += 1
                 win.energy_tab.refresh()
                 self.assertNotEqual(win.energy_tab.kpi_today.value.text(), "--")
-                self.assertGreater(float(win.energy_tab.kpi_today.value.text()), 0.0)
+                if seeded:  # 整数秒内恰好跨零点的极端情况不强行断言
+                    self.assertGreater(float(win.energy_tab.kpi_today.value.text()), 0.0)
                 self.assertIn("费用", win.energy_tab.kpi_today.sub.text())
 
                 win.tabs.setCurrentIndex(1)
