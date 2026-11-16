@@ -1,0 +1,1 @@
+Linux monitor, fan controller and energy tracker for Segotep / Kunlun HiMOS digital power supplies (CH340 serial; CLI + PySide6 GUI).

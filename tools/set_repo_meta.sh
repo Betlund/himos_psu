@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# 把 .github/topics.txt 里的标签同步到 GitHub 仓库（话题用于被发现/引流）。
-#   ./tools/set_repo_topics.sh            应用
-#   ./tools/set_repo_topics.sh --dry-run  只打印将要写入的列表
+# 把仓库的 About 信息同步到 GitHub：简介 + 话题（两者都是被搜到的入口）。
+#   ./tools/set_repo_meta.sh            应用
+#   ./tools/set_repo_meta.sh --dry-run  只打印将要写入的内容
+#
+# 简介来自 .github/description.txt，话题来自 .github/topics.txt。
 #
 # 需要 gh 已登录且对仓库有写权限；无权限时会明确说明，而不是抛一个 404。
 set -uo pipefail
@@ -10,6 +12,7 @@ ROOT="$(cd "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT" || exit 2
 
 TOPICS_FILE="$ROOT/.github/topics.txt"
+DESC_FILE="$ROOT/.github/description.txt"
 REPO="$(git remote get-url origin 2>/dev/null | sed -E 's#.*github\.com[:/]([^/]+/[^/.]+)(\.git)?#\1#')"
 DRY=0
 [ "${1:-}" = "--dry-run" ] && DRY=1
@@ -33,9 +36,19 @@ for name in "${NAMES[@]}"; do
     fi
 done
 
+DESCRIPTION=""
+if [ -f "$DESC_FILE" ]; then
+    DESCRIPTION="$(head -1 "$DESC_FILE")"
+fi
+if [ -n "$DESCRIPTION" ] && [ "${#DESCRIPTION}" -gt 350 ]; then
+    echo "错误：简介超过 350 字符" >&2
+    exit 2
+fi
+
 echo "仓库 : $REPO"
-echo "数量 : $COUNT"
-printf '将写入: %s\n' "$(printf '%s ' "${NAMES[@]}")"
+echo "简介 : ${DESCRIPTION:-（不修改）}"
+echo "话题 : $COUNT 个"
+printf '       %s\n' "$(printf '%s ' "${NAMES[@]}")"
 
 if [ "$DRY" -eq 1 ]; then
     exit 0
@@ -55,6 +68,10 @@ if [ "$PUSH_OK" != "true" ]; then
      $(printf '%s ' "${NAMES[@]}")
 EOF
     exit 1
+fi
+
+if [ -n "$DESCRIPTION" ]; then
+    gh api -X PATCH "repos/$REPO" -f description="$DESCRIPTION" --jq '.description' 2>&1 | sed 's/^/  ✓ 简介: /'
 fi
 
 # 通过 stdin 传 JSON，避免写临时文件
