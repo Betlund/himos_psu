@@ -1,5 +1,6 @@
 # himos-psu — 鑫谷 / 昆仑 HiMOS 数字电源 Linux 上位机
 
+[![CI](https://github.com/Betlund/himos_psu/actions/workflows/ci.yml/badge.svg)](https://github.com/Betlund/himos_psu/actions/workflows/ci.yml)
 ![license](https://img.shields.io/badge/license-MIT-blue.svg)
 ![python](https://img.shields.io/badge/python-3.10%2B-blue.svg)
 ![platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)
@@ -141,6 +142,10 @@ GUI 的「能耗统计」页会随采集自动刷新；采集进程与 GUI **互
 ```
 
 测试覆盖真实抓包帧解码、CRC 双口径、分包重同步、梯形积分与断档、峰谷边界、改价重算、CSV 导出、采集锁互斥，以及 GUI 三个页签的离屏渲染。
+
+## 更新日志
+
+见 [CHANGELOG.md](CHANGELOG.md)，当前版本 [v0.2.0](https://github.com/Betlund/himos_psu/releases/tag/v0.2.0)。
 
 ## 开源协议
 

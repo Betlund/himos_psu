@@ -637,7 +637,7 @@ class EnergyTab(QtWidgets.QWidget):
         cal_layout = QtWidgets.QVBoxLayout(cal_card)
         cal_layout.setContentsMargins(12, 8, 10, 8)
         cal_head = QtWidgets.QHBoxLayout()
-        cal_title = QtWidgets.QLabel("本月用电日历")
+        cal_title = QtWidgets.QLabel("用电日历")
         cal_title.setStyleSheet(f"color: {TEXT}; font-weight: bold;")
         cal_head.addWidget(cal_title)
         cal_head.addStretch(1)
