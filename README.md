@@ -1,27 +1,50 @@
-# himos-psu — 鑫谷 / 昆仑九重系列电源开源 Linux 上位机
+# himos-psu — 鑫谷 / 昆仑 HiMOS 数字电源 Linux 上位机
 
-基于对 `HiMOS 1.6.1` 与实机 `昆仑九重 KE-1300P`（CH340 `1A86:7523`, `115200` bps）逆向与抓包验证开发的轻量开源 Linux 监控、调速与能耗统计上位机，完全本地离线运行，无任何云端遥测或硬编码密钥。
+![license](https://img.shields.io/badge/license-MIT-blue.svg)
+![python](https://img.shields.io/badge/python-3.10%2B-blue.svg)
+![platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)
+
+**在 Linux 上监控并调速鑫谷 / 昆仑（Segotep / Kunlun）HiMOS 系列数字电源。**
+厂商只提供 Windows 上位机，这个项目把协议重写了一遍：实时电压/功率/温度、风扇曲线、以及本地的用电量与电费统计，全程离线、无遥测。
+
+![能耗统计页](docs/energy-dashboard.png)
+
+## 快速上手
+
+```bash
+git clone https://github.com/Betlund/himos_psu.git && cd himos_psu
+./bin/himos-psu list          # 自动发现 CH340 (1A86:7523) 电源
+./bin/himos-psu-gui           # 桌面面板；无硬件时加 --mock
+```
+
+只要 Python ≥ 3.10，Linux 下串口走标准库 `termios`，**不需要装 pyserial**；GUI 需要 `PySide6`。
+
+## 截图
+
+| 实时监控 | 能耗统计 |
+|---|---|
+| ![实时监控](docs/realtime-dashboard.png) | ![能耗统计](docs/energy-dashboard.png) |
+
+> 截图使用 `--mock` 的合成设备与示例数据，序列号与编号均非真实值。
 
 ## 特性
 
 - **零额外串口依赖**：Linux 下通过标准库 `termios` / `select` + `/sys/class/tty` 自动发现 `1A86:7523` 串口（跨平台亦可选用 `pyserial`）。
 - **协议 1:1 精准实现并修正实机差异**：
-  - 自动顺序下发 `POWER_INFO(sub=0)`（型号/规格/代工 `segotep`/SN）与 `POWER_INFO(sub=53)`（固件日期 `V4.24.09.20`）并合并。
-  - 同时兼容 PC 发送端 `crc8(commandContent)` 与 `KE-1300P` 固件接收端 `crc8(header + commandContent)` 双口径校验。
+  - 自动顺序下发 `POWER_INFO(sub=0)`（型号/规格/代工 `segotep`/SN）与 `POWER_INFO(sub=53)`（固件日期）并合并。
+  - 同时兼容 PC 发送端 `crc8(commandContent)` 与实机固件接收端 `crc8(header + commandContent)` 双口径校验。
   - 完整解析 `+3.3V / +5V / +12V / +5VSB`、`输入功率 / 输入电压 / 频率`、高压区 / 低压区 / 环境三路温度、风扇转速与故障码。
   - 严格复刻 `ControlChart` 与 `x9` 分段线性重采样生成 27 字节自定义温控风扇曲线。
 - **CLI + PySide6 原生桌面 GUI**：命令行实时监控、JSON 输出、原始十六进制嗅探；GUI 分「实时监控 / 能耗统计 / 设置」三页，含 5 点可拖拽风扇曲线编辑器。
-- **能耗统计（v0.2 新增）**：后台采集并把输入功率积分成 kWh，支持固定电价与峰谷（尖/峰/平/谷）电价、今日/本周/本月/今年报表、月历热力图、负载率分布、供电会话、CSV/JSON 导出与改价重算历史费用。
+- **能耗统计**：后台采集并把输入功率积分成 kWh，支持固定电价与峰谷（尖/峰/平/谷）电价、今日/本周/本月/今年报表、月历热力图、负载率分布、供电会话、CSV/JSON 导出与改价重算历史费用。
 
-## 快速上手
-
-在本仓库目录下无需安装包即可直接使用（显式调用系统 `/usr/bin/python3`）：
+## 命令行
 
 ```bash
 # 查看检测到的电源串口
 ./bin/himos-psu list
 
-# 读取 KE-1300P 规格、版本号、序列号与徽章状态
+# 读取规格、固件版本、出厂日期、序列号与徽章状态
 ./bin/himos-psu info
 
 # 持续刷新监控遥测数据（Ctrl+C 退出）
@@ -94,16 +117,30 @@ GUI 的「能耗统计」页会随采集自动刷新；采集进程与 GUI **互
 ./bin/himos-psu energy export --kind sessions --out -       # 供电会话
 ```
 
-### GUI
-
-`./bin/himos-psu-gui` 打开后切到「能耗统计」页：KPI 卡、今日/近 7 天/近 30 天曲线、
-本月分时段占比、月历热力图、负载率分布、最近供电会话，以及导出与电价设置入口。
-
-![能耗统计页](docs/energy-dashboard.png)
-
 ## 权限说明
 
-若普通用户无权打开 `/dev/ttyUSB0`，可将用户加入串口所属用户组（如 `uucp` 或 `dialout`），或通过 `./bin/himos-psu udev-rule` 生成标准 `1a86:7523` udev 规则。
+若普通用户无权打开 `/dev/ttyUSB*`，可将用户加入串口所属用户组（如 `uucp` 或 `dialout`），或通过 `./bin/himos-psu udev-rule` 生成标准 `1a86:7523` udev 规则。
+
+## 兼容性
+
+在 `昆仑九重 KE-1300P`（CH340，固件 `V4.24.09.20`）上逆向并实测通过。
+其他使用 HiMOS 上位机、同样是 CH340 转串口的型号理论上通用，但未逐款验证——如果你测试成功，欢迎开 issue 报告型号。
+
+## 开发与测试
+
+```bash
+# 单元测试（协议、能耗积分、电价、GUI 离屏渲染）
+/usr/bin/python3 -m unittest discover -s tests
+
+# 完整本地流水线：语法 + 测试 + 隐私扫描（工作区/暂存区/全历史）
+./tools/pipeline.sh
+
+# 无硬件联调：先用 mock 电源采集一段，再查看报表
+./bin/himos-psu --mock collect --db /tmp/demo.db
+./bin/himos-psu energy --db /tmp/demo.db today
+```
+
+测试覆盖真实抓包帧解码、CRC 双口径、分包重同步、梯形积分与断档、峰谷边界、改价重算、CSV 导出、采集锁互斥，以及 GUI 三个页签的离屏渲染。
 
 ## 开源协议
 
@@ -113,16 +150,6 @@ GUI 的「能耗统计」页会随采集自动刷新；采集进程与 GUI **互
 未获其授权或背书。产品名称与型号仅用于说明兼容性。使用本工具可能使电源运行在非出厂设定的
 风扇曲线上，请自行评估风险；因使用本软件造成的任何损失，作者不承担责任。
 
-## 开发与测试
+---
 
-```bash
-# 单元测试（协议、能耗积分、电价、GUI 离屏渲染）
-/usr/bin/python3 -m unittest discover -s tests
-
-# 无硬件联调：先用 mock 电源采集一段，再查看报表
-./bin/himos-psu --mock collect --db /tmp/demo.db
-./bin/himos-psu energy --db /tmp/demo.db today
-```
-
-测试覆盖真实抓包帧解码、CRC 双口径、分包重同步、梯形积分与断档、峰谷/阶梯边界、
-改价重算、CSV 导出、采集锁互斥，以及 GUI 三个页签的离屏渲染。
+如果这个项目帮你省下了折腾的时间，点个 ⭐ 是最大的鼓励；有问题或新机型适配欢迎开 issue。
