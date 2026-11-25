@@ -192,7 +192,11 @@ def persist_device_settings(
         if refresh_mode is None:
             updates["refresh_mode"] = None
         else:
-            rm = RefreshMode(refresh_mode) if isinstance(refresh_mode, RefreshMode) else RefreshMode.from_value(refresh_mode)  # type: ignore[arg-type]
+            rm = (
+                refresh_mode
+                if isinstance(refresh_mode, RefreshMode)
+                else RefreshMode.from_value(refresh_mode)  # type: ignore[arg-type]
+            )
             updates["refresh_mode"] = rm.interval_ms
     if auto_restore is not _UNSET:
         updates["auto_restore"] = bool(auto_restore)

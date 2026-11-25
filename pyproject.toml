@@ -10,8 +10,18 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
+authors = [{ name = "BetLund" }]
+keywords = [
+    "psu",
+    "power-supply",
+    "energy-monitoring",
+    "fan-control",
+    "segotep",
+    "kunlun",
+    "ch340",
+    "reverse-engineering",
+]
 classifiers = [
-    "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Topic :: System :: Hardware",
@@ -35,3 +45,7 @@ himos-psu-gui = "himos_psu.gui:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# The window icon is loaded relative to gui.py, so a wheel without this has no icon.
+[tool.setuptools.package-data]
+himos_psu = ["assets/*.svg"]

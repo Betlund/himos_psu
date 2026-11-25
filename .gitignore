@@ -3,3 +3,10 @@ __pycache__/
 .venv/
 _preview/
 *.egg-info/
+*.db
+*.db-wal
+*.db-shm
+build/
+dist/
+.ruff_cache/
+.pytest_cache/

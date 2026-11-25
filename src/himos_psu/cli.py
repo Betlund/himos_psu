@@ -340,16 +340,21 @@ def _cmd_apply_saved(args: argparse.Namespace) -> int:
 
 
 def _default_systemd_exec() -> str:
+    """Absolute path of the CLI, resolved from this checkout or from $PATH."""
     repo_bin = Path(__file__).resolve().parents[2] / "bin" / "himos-psu"
     if repo_bin.is_file():
-        candidate = str(repo_bin)
-    else:
-        which_bin = shutil.which("himos-psu")
-        candidate = which_bin if which_bin else f"{sys.executable} -m himos_psu"
+        return str(repo_bin)
+    which_bin = shutil.which("himos-psu")
+    return which_bin if which_bin else f"{sys.executable} -m himos_psu"
+
+
+def _systemd_exec(value: str | None) -> str:
+    """ExecStart path, with $HOME collapsed to systemd's %h specifier."""
+    path = (value or "").strip() or _default_systemd_exec()
     home_str = str(Path.home())
-    if candidate == home_str or candidate.startswith(home_str + os.sep):
-        candidate = "%h" + candidate[len(home_str):]
-    return candidate
+    if path == home_str or path.startswith(home_str + os.sep):
+        path = "%h" + path[len(home_str):]
+    return path
 
 
 def _cmd_daemon(args: argparse.Namespace) -> int:
@@ -387,10 +392,7 @@ LEGACY_UNIT_NAME = "himos-psu-restore.service"
 
 
 def _daemon_unit_text(args: argparse.Namespace) -> str:
-    exec_bin = args.exec.strip() if args.exec else _default_systemd_exec()
-    home_str = str(Path.home())
-    if exec_bin == home_str or exec_bin.startswith(home_str + os.sep):
-        exec_bin = "%h" + exec_bin[len(home_str):]
+    exec_bin = _systemd_exec(args.exec)
     # StartLimit* are [Unit] keys since systemd 230; in [Service] they are silently
     # ignored ("Unknown key" in the journal) and the rate limit stays at the default.
     return (
@@ -570,10 +572,7 @@ def _install_daemon_unit(unit: str, args: argparse.Namespace) -> int:
 
 
 def _cmd_systemd_unit(args: argparse.Namespace) -> int:
-    exec_bin = args.exec.strip() if args.exec else _default_systemd_exec()
-    home_str = str(Path.home())
-    if exec_bin == home_str or exec_bin.startswith(home_str + os.sep):
-        exec_bin = "%h" + exec_bin[len(home_str):]
+    exec_bin = _systemd_exec(args.exec)
     wait_arg = f"{max(0.0, args.wait_port):g}"
     unit = (
         "[Unit]\n"
@@ -929,7 +928,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_udev = sub.add_parser("udev-rule", help="打印无需 root 访问 CH340 串口的 udev 规则示例")
     p_udev.set_defaults(func=lambda _: (sys.stdout.write(UDEV_RULE), 0)[1])
 
-    p_systemd = sub.add_parser("systemd-unit", help="打印开机自动恢复电源配置的 systemd --user 服务单元")
+    p_systemd = sub.add_parser(
+        "systemd-unit",
+        help="打印开机恢复电源配置的旧版单元（守护进程已内置恢复，保留给无守护进程的用法）",
+    )
     p_systemd.add_argument("--exec", help="自定义 himos-psu 可执行路径")
     p_systemd.add_argument("--wait-port", type=float, default=15.0, help="启动时等待串口就绪的最大秒数（默认 15）")
     p_systemd.set_defaults(func=_cmd_systemd_unit)

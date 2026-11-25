@@ -18,7 +18,6 @@ from .protocol import (
     CmdId,
     FanMode,
     RefreshMode,
-    encode_frame,
     parse_frame,
 )
 
@@ -176,7 +175,9 @@ class PosixSerialTransport:
             fd = os.open(self.port_name, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
         except PermissionError as exc:
             raise PermissionError(
-                f"Permission denied opening {self.port_name}. Add user to serial group (uucp/dialout) or install udev rule (`himos-psu udev-rule`)."
+                f"Permission denied opening {self.port_name}. "
+                "Add user to serial group (uucp/dialout) or install the udev rule "
+                "(`himos-psu udev-rule`)."
             ) from exc
 
         try:

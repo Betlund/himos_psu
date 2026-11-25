@@ -300,7 +300,7 @@ class GuiRemoteTestCase(unittest.TestCase):
         cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
     def test_gui_follows_daemon_over_ipc(self) -> None:
-        from PySide6 import QtCore, QtWidgets
+        from PySide6 import QtWidgets
 
         from himos_psu.gui import MainWindow
 
@@ -333,11 +333,16 @@ class GuiRemoteTestCase(unittest.TestCase):
                     db_path=root / "energy.db",
                 )
                 window.resize(1180, 800)
-                deadline = time.monotonic() + 6
-                while time.monotonic() < deadline:
+
+                def ready() -> bool:
+                    return window._remote and window.metric_labels["power"].text() != "--"
+
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline and not ready():
                     self.app.processEvents()
                     time.sleep(0.03)
-                self.assertTrue(window._remote)
+                self.assertTrue(window._remote, "GUI did not switch to the daemon over IPC")
+                self.assertNotEqual(window.metric_labels["power"].text(), "--")
                 self.assertIsNone(window.client)  # GUI must not open the serial port
                 self.assertNotEqual(window.metric_labels["power"].text(), "--")
                 self.assertIn("KE-1300P", window.title_label.text())

@@ -20,6 +20,10 @@
 
 ### 修复
 
+- 打包元数据：去掉 `License :: OSI Approved :: MIT License` 分类器（PEP 639 下与
+  `license = "MIT"` 冲突，setuptools ≥ 77 直接抛 `InvalidConfigError`，`pip install .` 会失败），
+  补 `keywords` / `authors`，并为 `assets/*.svg` 声明 package-data，安装后窗口图标不再丢失。
+- `bin/himos-psu-gui` 改为委托 `bin/himos-psu gui`，不再重复一遍 PYTHONPATH 解析。
 - CLI 的覆盖率一行补上「记录时段」并新增 `first_sample_at` / `last_sample_at` 字段：
   覆盖率的分母是首末分钟桶而不是日历区间，不打印时段时容易被误读成「今天漏了 10%」。
 - 生成的 user 单元不再给 `daemon` 加 `--quiet`：服务里 journal 是唯一的日志出口，
@@ -33,8 +37,10 @@
 
 ### 工程
 
+- 统一 `ExecStart` 的路径处理为 `_systemd_exec()`（原先三处各写一遍 `$HOME` → `%h` 的转换），
+  清理未使用的导入，并把 GUI 冒烟测试从「固定睡眠 6 秒」改为等待就绪条件。
 - 新增 GitHub Actions（`.github/workflows/ci.yml`）：Python 3.10/3.12 矩阵，
-  跑语法检查、23 个单元测试与全历史隐私扫描。
+  跑语法检查、47 个单元测试与全历史隐私扫描。
 
 ## [0.2.0] - 2026-11-16
 

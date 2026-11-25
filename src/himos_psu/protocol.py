@@ -306,7 +306,9 @@ def parse_frame(frame: bytes | bytearray) -> RawFrame:
     )
 
 
-def parse_command_content(cmd_id: int, payload: bytes) -> PowerStatus | PowerInfo | PowerSerial | PowerExtraTelemetry | bytes:
+def parse_command_content(
+    cmd_id: int, payload: bytes
+) -> PowerStatus | PowerInfo | PowerSerial | PowerExtraTelemetry | bytes:
     """Decode command payload matching HiMOS parseCommandContent."""
     if cmd_id == CmdId.POWER_STATUS_RESPONSE:
         if len(payload) < 28:

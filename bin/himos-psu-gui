@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
-# Load src/ from the checkout this script lives in (works from any cwd and via symlinks).
+# Thin alias: the GUI lives behind `himos-psu gui`, so resolve the sibling script
+# (which sets PYTHONPATH from its own checkout) and let it do the work.
 HERE="$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")"
-PYTHONPATH="$HERE/../src${PYTHONPATH:+:$PYTHONPATH}" exec /usr/bin/python3 -m himos_psu gui "$@"
+exec "$HERE/himos-psu" gui "$@"

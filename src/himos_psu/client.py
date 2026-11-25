@@ -7,7 +7,6 @@ import time
 from typing import Any, Callable, Sequence
 
 from .protocol import (
-    CmdId,
     FanMode,
     PowerExtraTelemetry,
     PowerInfo,
