@@ -14,7 +14,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from himos_psu import ipc
+from himos_psu import ipc, protocol
 from himos_psu.collector import Collector, StaleError
 from himos_psu.daemon import Daemon
 from himos_psu.energy import EnergyStore
@@ -28,6 +28,19 @@ def wait_for(predicate, timeout: float = 5.0, interval: float = 0.05) -> bool:
             return True
         time.sleep(interval)
     return predicate()
+
+
+def make_status_frame(power_raw: int) -> protocol.RawFrame:
+    """Build one synthetic POWER_STATUS_RESPONSE frame (unique bytes per call)."""
+    payload = bytearray(28)
+    payload[0:2] = (3300).to_bytes(2, "little")
+    payload[2:4] = (5000).to_bytes(2, "little")
+    payload[4:6] = (12000).to_bytes(2, "little")
+    payload[6:8] = (5000).to_bytes(2, "little")
+    payload[12:14] = power_raw.to_bytes(2, "little")
+    payload[24:26] = (16).to_bytes(2, "little")
+    body = bytes([len(payload) + 2, protocol.CmdId.POWER_STATUS_RESPONSE]) + bytes(payload)
+    return protocol.parse_frame(protocol.encode_frame(body))
 
 
 class IpcTestCase(unittest.TestCase):
@@ -159,6 +172,54 @@ class DaemonTestCase(unittest.TestCase):
             self.assertGreater(store.sample_count(), 0)
         finally:
             store.close()
+
+    def test_snapshot_keeps_static_frames_after_telemetry_churn(self) -> None:
+        """A subscriber joining hours later must still receive the specs.
+
+        Every status/telemetry frame is unique on the wire, so a cache keyed by raw
+        bytes gets flushed within seconds and late GUIs showed "--" for the vendor.
+        """
+        self.daemon.start()
+        self.assertTrue(wait_for(lambda: probe_socket(self.daemon.socket_path)))
+        self.assertTrue(
+            wait_for(
+                lambda: "info_vendor" in self.daemon._frames
+                and "info_date" in self.daemon._frames
+                and "sn" in self.daemon._frames
+            ),
+            "handshake frames were not cached",
+        )
+
+        # Simulate a long-running session: all of these are distinct wire frames.
+        for tick in range(200):
+            self.daemon._on_frame(make_status_frame(4000 + tick), None)
+
+        events: list[dict] = []
+        client = SocketClient(self.daemon.socket_path, on_event=events.append)
+        try:
+            client.subscribe()
+            self.assertTrue(
+                wait_for(lambda: any(e.get("event") == "frame" for e in events)),
+                "no snapshot received",
+            )
+            frames = [e for e in events if e.get("event") == "frame"]
+            info_raw = {e["raw"] for e in frames if e.get("cmd") == 3}
+            self.assertGreaterEqual(len(info_raw), 2, "both POWER_INFO variants must survive")
+            self.assertTrue(any(e.get("cmd") == 5 for e in frames), "SN frame must survive")
+
+            merged = protocol.SpecsMerger()
+            for payload_hex in info_raw:
+                raw = protocol.parse_frame(bytes.fromhex(payload_hex))
+                merged.update(protocol.parse_command_content(raw.cmd_id, raw.payload))
+            self.assertIsNotNone(merged.current)
+            assert merged.current is not None
+            self.assertEqual(merged.current.model, "KE-1300P")
+            self.assertEqual(merged.current.manufacture, "segotep")
+            self.assertGreater(
+                merged.current.year + merged.current.month + merged.current.day, 0
+            )
+        finally:
+            client.close()
 
     def test_second_daemon_cannot_take_the_port(self) -> None:
         self.daemon.start()

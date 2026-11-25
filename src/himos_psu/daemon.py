@@ -23,9 +23,35 @@ from .collector import Collector, CollectorBusy, StaleError
 from .config import apply_profile_to_client, load_saved_profile
 from .energy import DEFAULT_DB, EnergyStore
 from .ipc import IpcServer, default_socket_path
-from .protocol import FanMode, PowerInfo, PowerStatus, RawFrame, RefreshMode
+from .protocol import CmdId, FanMode, PowerInfo, PowerStatus, RawFrame, RefreshMode
 
 MAX_CACHED_FRAMES = 12
+
+# Static frames describe the unit itself and never change during a session, so they
+# must survive a late subscriber even after thousands of telemetry frames. Volatile
+# ones (status/telemetry) only need their latest copy.
+PINNED_FRAME_KEYS = frozenset({"info_vendor", "info_date", "sn"})
+
+
+def frame_cache_key(raw: RawFrame) -> str:
+    """Category key used by the daemon's snapshot cache.
+
+    Keying by command id is wrong (0x03 answers both sub=0 and sub=53) and keying by
+    raw bytes loses the static frames to LRU churn, so classify by kind instead.
+    """
+    if raw.cmd_id == CmdId.POWER_INFO_RESPONSE:
+        payload = raw.payload
+        # Same discriminator as protocol.parse_command_content: the build-date block
+        # stores year/month/day in bytes 22-24, the vendor block keeps ASCII there.
+        is_vendor = len(payload) >= 25 and (payload[23] > 12 or payload[24] > 31)
+        return "info_vendor" if is_vendor else "info_date"
+    if raw.cmd_id == CmdId.POWER_SN_RESPONSE:
+        return "sn"
+    if raw.cmd_id == CmdId.POWER_STATUS_RESPONSE:
+        return "status"
+    if raw.cmd_id == CmdId.POWER_INFO:
+        return "telemetry"
+    return raw.raw_bytes.hex()
 
 
 class Daemon:
@@ -65,8 +91,8 @@ class Daemon:
         self._failed = False
         self._thread: threading.Thread | None = None
         self._state = "未启动"
-        # Keyed by raw payload: cmd=0x03 arrives twice (sub=0 vendor/SN, sub=53 build
-        # date) and both are needed for the GUI-side SpecsMerger, so do not key by cmd.
+        # Keyed by frame kind (see frame_cache_key): the static specs must be replayed
+        # to any late subscriber, the volatile telemetry only in its latest form.
         self._frames: dict[str, dict[str, Any]] = {}
         self._restored = False
 
@@ -206,11 +232,16 @@ class Daemon:
             "raw": raw.raw_bytes.hex(),
             "crc_ok": bool(raw.crc_valid),
         }
-        key = raw.raw_bytes.hex()
+        key = frame_cache_key(raw)
         self._frames.pop(key, None)
         self._frames[key] = payload
         while len(self._frames) > MAX_CACHED_FRAMES:
-            self._frames.pop(next(iter(self._frames)), None)
+            victim = next(
+                (k for k in self._frames if k not in PINNED_FRAME_KEYS and k != key), None
+            )
+            if victim is None:
+                break
+            self._frames.pop(victim, None)
         self._broadcast(payload)
 
     def _on_specs(self, info: PowerInfo | None, sn: str) -> None:
