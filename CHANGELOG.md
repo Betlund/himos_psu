@@ -9,6 +9,9 @@
 - **后台采集守护进程（`himos-psu daemon`）**：独占串口并 24/7 采集，通过 Unix socket 对外提供
   NDJSON IPC——订阅遥测、下发风扇模式/曲线/刷新周期、清故障码。GUI 检测到守护进程时自动切换为
   IPC 跟随模式（不再打开串口），可边采集边调速；`systemd-daemon` 生成带 `Restart=always` 的用户单元。
+- `systemd-daemon` 新增 `--install` / `--enable` / `--linger` / `--dry-run`：一条命令把守护进程装成
+  `systemd --user` 服务并启用（不再需要手工重定向写单元文件）。检测到还有手跑的 daemon 占用串口时
+  会拒绝启用并提示先停掉它；发现旧的 `himos-psu-restore.service` 会打印退役命令。
 - `collect` / `daemon` 新增 `--stale-timeout`：超过 N 秒收不到遥测即退出，交由 systemd 重启，
   用于休眠唤醒后 USB 重新枚举的场景。
 - 风扇配置持久化与启动自动恢复：新增 `config.py`，在 GUI 切换模式（排除一次性 `Clean`）、点击「应用自定义曲线」或调节刷新周期时将配置原子写入 `~/.config/himos-psu/settings.json`。

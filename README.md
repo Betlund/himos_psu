@@ -114,13 +114,17 @@ GUI 的「能耗统计」页会随采集自动刷新；采集进程与 GUI **互
 # 1. 先手动试跑，确认能连上电源（Ctrl+C 停止）
 ./bin/himos-psu daemon
 
-# 2. 装成 systemd --user 服务
-mkdir -p ~/.config/systemd/user
-./bin/himos-psu systemd-daemon > ~/.config/systemd/user/himos-psu-collect.service
-systemctl --user daemon-reload
-systemctl --user enable --now himos-psu-collect.service
+# 2. 一条命令装成 systemd --user 服务并立即启用
+./bin/himos-psu systemd-daemon --install --enable --linger
+
+# 3. 确认状态
 systemctl --user status himos-psu-collect.service
 ```
+
+`--install` 会写入 `~/.config/systemd/user/himos-psu-collect.service`（跟随 `XDG_CONFIG_HOME`）
+并执行 `daemon-reload`；`--enable` 顺带 `enable --now`，`--linger` 让未登录时也采集。
+如果此时还有手工 `himos-psu daemon` 在跑，命令会**拒绝启用**并提示先按 Ctrl+C——串口是独占的，
+否则新服务只会反复启动失败。只想看单元内容或预览命令，用不带参数或加 `--dry-run`。
 
 守护进程独占串口并 24/7 写 `energy.db`。**GUI 启动时如果发现守护进程在运行，会自动通过
 Unix socket 跟随它**（默认 `$XDG_RUNTIME_DIR/himos-psu/daemon.sock`，可用 `HIMOS_PSU_SOCKET`
@@ -129,10 +133,10 @@ Unix socket 跟随它**（默认 `$XDG_RUNTIME_DIR/himos-psu/daemon.sock`，可�
 - 连接后自动恢复保存的风扇配置，等价于原来的 `himos-psu-restore.service`，后者可以退役
 - 超过 `--stale-timeout`（单元里默认 180 秒）收不到遥测会自动退出，由 systemd 重启；
   这是应对休眠唤醒后 USB 重新枚举的方式
-- 想「开机就采、不必登录」，需要 `loginctl enable-linger $USER`
+- 想「开机就采、不必登录」，需要 `loginctl enable-linger $USER`（`--install --linger` 会自动做）
 - 只想临时采集仍可用 `./bin/himos-psu collect`（与守护进程/GUI 互斥）
 
-从旧的恢复服务迁移：
+从旧的恢复服务迁移（`--install` 检测到旧单元时会打印这段命令）：
 
 ```bash
 systemctl --user disable --now himos-psu-restore.service

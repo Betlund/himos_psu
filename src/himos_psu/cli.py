@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import shutil
+import subprocess
 import sys
 import time
 from datetime import date, datetime, timedelta
@@ -380,12 +382,16 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         return 1
 
 
-def _cmd_systemd_daemon(args: argparse.Namespace) -> int:
+DAEMON_UNIT_NAME = "himos-psu-collect.service"
+LEGACY_UNIT_NAME = "himos-psu-restore.service"
+
+
+def _daemon_unit_text(args: argparse.Namespace) -> str:
     exec_bin = args.exec.strip() if args.exec else _default_systemd_exec()
     home_str = str(Path.home())
     if exec_bin == home_str or exec_bin.startswith(home_str + os.sep):
         exec_bin = "%h" + exec_bin[len(home_str):]
-    unit = (
+    return (
         "[Unit]\n"
         "Description=HiMOS PSU background collector (serial owner + IPC daemon)\n"
         "After=default.target\n"
@@ -402,7 +408,106 @@ def _cmd_systemd_daemon(args: argparse.Namespace) -> int:
         "[Install]\n"
         "WantedBy=default.target\n"
     )
-    sys.stdout.write(unit)
+
+
+def _systemd_user_dir() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(base) / "systemd" / "user"
+
+
+def _run_systemctl(argv: Sequence[str], *, dry_run: bool) -> int:
+    printable = " ".join(argv)
+    if dry_run:
+        print(f"$ {printable}")
+        return 0
+    if shutil.which(argv[0]) is None:
+        print(f"错误: 找不到 {argv[0]}，请手动执行: {printable}", file=sys.stderr)
+        return 1
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"错误: 执行 {printable} 失败: {exc}", file=sys.stderr)
+        return 1
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        print(f"错误: {printable} 返回 {proc.returncode}: {detail}", file=sys.stderr)
+        if argv[0] == "systemctl" and "--user" in argv:
+            print(
+                "提示: systemctl --user 需要登录会话的 D-Bus；在 SSH、nspawn 或容器里会连不上，"
+                "请在桌面终端里重试。",
+                file=sys.stderr,
+            )
+        return 1
+    return 0
+
+
+def _cmd_systemd_daemon(args: argparse.Namespace) -> int:
+    unit = _daemon_unit_text(args)
+    if not args.install:
+        sys.stdout.write(unit)
+        return 0
+    return _install_daemon_unit(unit, args)
+
+
+def _install_daemon_unit(unit: str, args: argparse.Namespace) -> int:
+    from .ipc import default_socket_path, probe_socket
+
+    dest_dir = _systemd_user_dir()
+    dest = dest_dir / DAEMON_UNIT_NAME
+    socket_path = default_socket_path()
+
+    # The serial port is exclusive: enabling the unit while a hand-started daemon
+    # still owns it only produces a crash loop, so refuse up front.
+    if args.enable and probe_socket(socket_path):
+        if not args.dry_run:
+            print(
+                f"检测到后台采集正在运行（{socket_path}）。\n"
+                "请先在运行 `himos-psu daemon` 的终端按 Ctrl+C 停掉它，然后重新执行本命令；"
+                "否则新服务会因为串口被独占而反复启动失败。",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"注意: 后台采集正在运行（{socket_path}），实际执行时需要先停掉它。")
+
+    if args.dry_run:
+        print(f"将写入 {dest}")
+    else:
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            tmp = dest.with_suffix(dest.suffix + ".tmp")
+            tmp.write_text(unit, encoding="utf-8")
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, dest)
+        except OSError as exc:
+            print(f"错误: 无法写入 {dest}: {exc}", file=sys.stderr)
+            return 1
+        print(f"已写入 {dest}")
+
+    legacy = dest_dir / LEGACY_UNIT_NAME
+    if legacy.exists():
+        print(
+            f"提示: 旧的 {LEGACY_UNIT_NAME} 仍在，守护进程已包含启动恢复功能，建议退役它：\n"
+            f"  systemctl --user disable --now {LEGACY_UNIT_NAME}\n"
+            f"  rm {legacy}"
+        )
+
+    rc = _run_systemctl(["systemctl", "--user", "daemon-reload"], dry_run=args.dry_run)
+    if rc != 0:
+        return rc
+    if args.enable:
+        rc = _run_systemctl(
+            ["systemctl", "--user", "enable", "--now", DAEMON_UNIT_NAME], dry_run=args.dry_run
+        )
+        if rc != 0:
+            return rc
+    if args.linger:
+        user = os.environ.get("USER") or getpass.getuser()
+        rc = _run_systemctl(["loginctl", "enable-linger", user], dry_run=args.dry_run)
+        if rc != 0:
+            return rc
+
+    print(f"查看状态: systemctl --user status {DAEMON_UNIT_NAME}")
+    print(f"查看日志: journalctl --user -u {DAEMON_UNIT_NAME} -f")
     return 0
 
 
@@ -743,10 +848,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_daemon.add_argument("--quiet", action="store_true", help="不打印进度")
     p_daemon.set_defaults(func=_cmd_daemon)
 
-    p_sysd = sub.add_parser("systemd-daemon", help="打印后台采集守护进程的 systemd --user 单元")
+    p_sysd = sub.add_parser(
+        "systemd-daemon",
+        help="打印或安装后台采集守护进程的 systemd --user 单元",
+        description="默认打印单元内容；加 --install 则写入 ~/.config/systemd/user/ 并可选立即启用。",
+    )
     p_sysd.add_argument("--exec", help="自定义 himos-psu 可执行路径")
     p_sysd.add_argument("--wait-port", type=float, default=30.0, help="启动时等待串口就绪的秒数")
     p_sysd.add_argument("--stale-timeout", type=float, default=180.0, help="无数据多久后重启")
+    p_sysd.add_argument("--install", action="store_true", help="写入 user 单元目录而不是打印到 stdout")
+    p_sysd.add_argument("--enable", action="store_true", help="安装后执行 systemctl --user enable --now")
+    p_sysd.add_argument("--linger", action="store_true", help="同时开启 linger（未登录也采集）")
+    p_sysd.add_argument("--dry-run", action="store_true", help="只打印将要执行的 systemctl 命令")
     p_sysd.set_defaults(func=_cmd_systemd_daemon)
 
     p_udev = sub.add_parser("udev-rule", help="打印无需 root 访问 CH340 串口的 udev 规则示例")

@@ -2,19 +2,23 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import os
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from himos_psu import ipc, protocol
+from himos_psu import cli, ipc, protocol
 from himos_psu.collector import Collector, StaleError
 from himos_psu.daemon import Daemon
 from himos_psu.energy import EnergyStore
@@ -349,6 +353,115 @@ class GuiRemoteTestCase(unittest.TestCase):
                     os.environ.pop(ipc.SOCKET_ENV, None)
                 else:
                     os.environ[ipc.SOCKET_ENV] = previous
+
+
+class DaemonUnitInstallTestCase(unittest.TestCase):
+    """`systemd-daemon --install` turns the manual daemon into a user service."""
+
+    @contextlib.contextmanager
+    def _sandbox_env(self, tmp: str, socket: str | None = None):
+        keys = ("XDG_CONFIG_HOME", ipc.SOCKET_ENV)
+        previous = {key: os.environ.get(key) for key in keys}
+        os.environ["XDG_CONFIG_HOME"] = tmp
+        # Never touch the real daemon socket: point at a path that cannot exist.
+        os.environ[ipc.SOCKET_ENV] = socket or str(Path(tmp) / "no-daemon.sock")
+        try:
+            yield
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def _run(self, argv: list[str]) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = cli.main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_print_mode_still_writes_unit_to_stdout(self) -> None:
+        rc, out, _err = self._run(["systemd-daemon", "--exec", "/usr/local/bin/himos-psu"])
+        self.assertEqual(rc, 0)
+        self.assertIn("[Unit]", out)
+        self.assertIn("Restart=always", out)
+        self.assertIn("ExecStart=/usr/local/bin/himos-psu daemon", out)
+
+    def test_dry_run_previews_commands_without_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "systemd" / "user" / "himos-psu-collect.service"
+            with self._sandbox_env(tmp):
+                rc, out, _err = self._run(
+                    ["systemd-daemon", "--install", "--enable", "--linger", "--dry-run"]
+                )
+            self.assertEqual(rc, 0)
+            self.assertIn(str(dest), out)
+            self.assertIn("$ systemctl --user daemon-reload", out)
+            self.assertIn("$ systemctl --user enable --now himos-psu-collect.service", out)
+            self.assertIn("$ loginctl enable-linger", out)
+            self.assertFalse(dest.exists(), "dry run must not touch the filesystem")
+
+    def test_install_writes_unit_and_enables_it(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run(argv, **_kwargs):
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "systemd" / "user" / "himos-psu-collect.service"
+            with self._sandbox_env(tmp), mock.patch(
+                "himos_psu.cli.shutil.which", return_value="/usr/bin/systemctl"
+            ), mock.patch("himos_psu.cli.subprocess.run", side_effect=fake_run):
+                rc, out, err = self._run(
+                    [
+                        "systemd-daemon",
+                        "--install",
+                        "--enable",
+                        "--linger",
+                        "--exec",
+                        "/usr/local/bin/himos-psu",
+                    ]
+                )
+            self.assertEqual(rc, 0, err)
+            self.assertIn(str(dest), out)
+            self.assertTrue(dest.is_file())
+            self.assertEqual(dest.stat().st_mode & 0o777, 0o644)
+            unit = dest.read_text(encoding="utf-8")
+            self.assertIn("ExecStart=/usr/local/bin/himos-psu daemon", unit)
+            self.assertIn("--stale-timeout 180", unit)
+            self.assertEqual(
+                calls,
+                [
+                    ["systemctl", "--user", "daemon-reload"],
+                    ["systemctl", "--user", "enable", "--now", "himos-psu-collect.service"],
+                    ["loginctl", "enable-linger", calls[2][2]],
+                ],
+            )
+            self.assertTrue(calls[2][2])
+
+    def test_install_refuses_while_a_manual_daemon_holds_the_port(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dest = root / "systemd" / "user" / "himos-psu-collect.service"
+            daemon = Daemon(
+                db_path=root / "energy.db",
+                socket_path=root / "daemon.sock",
+                mock=True,
+                restore=False,
+                quiet=True,
+            )
+            daemon.start()
+            try:
+                self.assertTrue(wait_for(lambda: probe_socket(root / "daemon.sock")))
+                with self._sandbox_env(tmp, socket=str(root / "daemon.sock")):
+                    rc, _out, err = self._run(["systemd-daemon", "--install", "--enable"])
+                self.assertEqual(rc, 1)
+                self.assertIn("Ctrl+C", err)
+                self.assertIn("串口被独占", err)
+                self.assertFalse(dest.exists(), "refusal must not leave a half-installed unit")
+            finally:
+                daemon.stop()
 
 
 if __name__ == "__main__":
