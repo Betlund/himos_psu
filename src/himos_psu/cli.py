@@ -402,8 +402,10 @@ def _daemon_unit_text(args: argparse.Namespace) -> str:
         "\n"
         "[Service]\n"
         "Type=simple\n"
+        # No --quiet: under systemd the journal is the only place the daemon can
+        # explain itself, and "exited status=1" without a reason is undebuggable.
         f"ExecStart={exec_bin} daemon --wait-port {max(0.0, args.wait_port):g}"
-        f" --stale-timeout {max(0.0, args.stale_timeout):g} --quiet\n"
+        f" --stale-timeout {max(0.0, args.stale_timeout):g}\n"
         "Restart=always\n"
         "RestartSec=5\n"
         "\n"

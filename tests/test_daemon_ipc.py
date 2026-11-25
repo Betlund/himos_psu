@@ -388,6 +388,8 @@ class DaemonUnitInstallTestCase(unittest.TestCase):
         self.assertIn("[Unit]", out)
         self.assertIn("Restart=always", out)
         self.assertIn("ExecStart=/usr/local/bin/himos-psu daemon", out)
+        # The journal is the service's only log sink, so do not silence it.
+        self.assertNotIn("--quiet", out)
         # StartLimit* moved to [Unit] in systemd 230; in [Service] they are ignored.
         unit_section, service_section = out.split("[Service]")
         self.assertIn("StartLimitIntervalSec=300", unit_section)
