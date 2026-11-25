@@ -315,6 +315,14 @@ class GuiRemoteTestCase(unittest.TestCase):
             window = None
             try:
                 self.assertTrue(wait_for(lambda: probe_socket(daemon.socket_path)))
+                # Let the daemon finish its startup handshake, then bury the specs under
+                # a long session's worth of unique telemetry frames, like a daemon that
+                # has been collecting for hours when the user finally opens the GUI.
+                self.assertTrue(
+                    wait_for(lambda: "info_vendor" in daemon._frames and "sn" in daemon._frames)
+                )
+                for tick in range(100):
+                    daemon._on_frame(make_status_frame(4000 + tick), None)
                 window = MainWindow(
                     mock=False,
                     config_path=root / "settings.json",
@@ -329,6 +337,9 @@ class GuiRemoteTestCase(unittest.TestCase):
                 self.assertIsNone(window.client)  # GUI must not open the serial port
                 self.assertNotEqual(window.metric_labels["power"].text(), "--")
                 self.assertIn("KE-1300P", window.title_label.text())
+                # Vendor and build date come from two different 0x03 frames; a
+                # snapshot that drops either one leaves this at "--".
+                self.assertEqual(window.spec_labels["vendor"].text(), "segotep")
                 window.grab()
             finally:
                 if window is not None:
