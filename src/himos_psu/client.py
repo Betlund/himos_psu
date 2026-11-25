@@ -149,23 +149,37 @@ class PowerSupplyClient:
                 return target
         raise TimeoutError(f"Timed out after {timeout:.1f}s waiting for POWER_STATUS_RESPONSE (0x02)")
 
-    def set_fan_mode(self, mode: FanMode, custom_points: Sequence[Sequence[int]] | None = None) -> bytes:
-        """Set active fan mode; optionally push custom curve 100ms after switching to CUSTOM."""
+    def set_fan_mode(
+        self,
+        mode: FanMode,
+        custom_points: Sequence[Sequence[int]] | None = None,
+        delay_s: float = 0.15,
+    ) -> bytes:
+        """Set active fan mode; pre-validate and push custom curve after switching to CUSTOM."""
         frame = build_fan_mode_frame(mode)
+        curve_frame = (
+            build_fan_curve_frame(custom_points, validate=True)
+            if (mode == FanMode.CUSTOM and custom_points is not None)
+            else None
+        )
         self._send_bytes(frame)
-        if mode == FanMode.CUSTOM and custom_points is not None:
-            time.sleep(0.1)
-            curve_frame = build_fan_curve_frame(custom_points)
+        if curve_frame is not None:
+            time.sleep(delay_s)
             self._send_bytes(curve_frame)
             return curve_frame
         return frame
 
-    def set_fan_curve(self, points: Sequence[Sequence[int]], switch_to_custom: bool = True) -> bytes:
+    def set_fan_curve(
+        self,
+        points: Sequence[Sequence[int]],
+        switch_to_custom: bool = True,
+        delay_s: float = 0.15,
+    ) -> bytes:
         """Validate, resample (x9), and upload a 5-point custom fan curve."""
         curve_frame = build_fan_curve_frame(points, validate=True)
         if switch_to_custom:
             self._send_bytes(build_fan_mode_frame(FanMode.CUSTOM))
-            time.sleep(0.1)
+            time.sleep(delay_s)
         self._send_bytes(curve_frame)
         return curve_frame
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 import time
@@ -14,6 +13,15 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from .client import PowerSupplyClient
 from .collector import Collector, CollectorBusy
+from .config import (
+    CONFIG_PATH,
+    PERSISTABLE_FAN_MODES,
+    SavedPsuProfile,
+    apply_profile_to_client,
+    load_config,
+    parse_saved_profile,
+    save_config,
+)
 from .energy import DEFAULT_DB, EnergyStore
 from .fan_curve import (
     DEFAULT_CUSTOM_POINTS,
@@ -21,6 +29,7 @@ from .fan_curve import (
     _js_round,
     clamp_dragged_point,
     resample_fan_curve,
+    validate_fan_curve,
 )
 from .gui_energy import CARD_QSS, EnergyTab, SettingsTab
 from .protocol import (
@@ -32,28 +41,9 @@ from .protocol import (
     format_warranty_badge,
 )
 
-CONFIG_PATH = Path.home() / ".config" / "himos-psu" / "settings.json"
-
 
 def _to_display_temp(celsius: float, fahrenheit: bool) -> float:
     return (1.8 * celsius + 32.0) if fahrenheit else celsius
-
-
-def _load_local_config(path: Path = CONFIG_PATH) -> dict:
-    try:
-        if path.is_file():
-            return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        pass
-    return {}
-
-
-def _save_local_config(data: dict, path: Path = CONFIG_PATH) -> None:
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    except OSError:
-        pass
 
 
 class FanCurveWidget(QtWidgets.QWidget):
@@ -323,12 +313,55 @@ class TelemetryWorker(QtCore.QThread):
     status_updated = QtCore.Signal(object)
     error_occurred = QtCore.Signal(str)
     state_changed = QtCore.Signal(str)
+    restoring_mode = QtCore.Signal(object)
+    profile_restored = QtCore.Signal(str)
 
-    def __init__(self, client: PowerSupplyClient, db_path: Path, parent: QtCore.QObject | None = None) -> None:
+    def __init__(
+        self,
+        client: PowerSupplyClient,
+        db_path: Path,
+        parent: QtCore.QObject | None = None,
+        *,
+        restore_profile: SavedPsuProfile | None = None,
+    ) -> None:
         super().__init__(parent)
         self.client = client
         self.db_path = Path(db_path)
+        self.restore_profile = restore_profile
         self._running = True
+
+    def _restore_on_connect(self, client: PowerSupplyClient, initial_status: PowerStatus) -> None:
+        profile = self.restore_profile
+        if profile is None or not profile.auto_restore or not profile.has_device_settings:
+            return
+        if initial_status.malfunction_code != 0:
+            self.profile_restored.emit(
+                f"检测到电源故障码 0x{initial_status.malfunction_code:04x}，已跳过启动自动恢复"
+            )
+            return
+        if profile.fan_mode is not None and initial_status.mode != profile.fan_mode:
+            self.restoring_mode.emit(profile.fan_mode)
+        try:
+            res = apply_profile_to_client(
+                client,
+                profile,
+                initial_status=initial_status,
+                if_needed=True,
+                confirm_timeout=0.0,
+            )
+        except Exception as exc:
+            self.profile_restored.emit(f"启动自动恢复配置失败: {exc}")
+            return
+        if res.applied:
+            parts: list[str] = []
+            if res.sent_mode and profile.fan_mode is not None:
+                parts.append(f"风扇模式 {profile.fan_mode.label}")
+            if res.sent_curve:
+                parts.append("自定义曲线")
+            if res.sent_refresh and profile.refresh_mode is not None:
+                parts.append(f"刷新 {profile.refresh_mode.interval_ms} ms")
+            if parts:
+                self.profile_restored.emit("已自动恢复上次保存的配置: " + " + ".join(parts))
 
     def run(self) -> None:
         store: EnergyStore | None = None
@@ -339,6 +372,7 @@ class TelemetryWorker(QtCore.QThread):
                 store,
                 on_state=self.state_changed.emit,
                 on_specs=lambda info, sn: self.info_updated.emit(info, sn),
+                on_first_status=self._restore_on_connect,
                 on_status=self.status_updated.emit,
             )
             collector.run(should_stop=lambda: not self._running)
@@ -380,9 +414,19 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
         self.client = client or PowerSupplyClient(port=port, mock=mock)
         self._worker: TelemetryWorker | None = None
-        self._cfg = _load_local_config(self._config_path)
+        self._cfg = load_config(self._config_path)
         self._fahrenheit = bool(self._cfg.get("fahrenheit", False))
         self._sensor = TempSensor(int(self._cfg.get("sensor", int(TempSensor.LOW_VOLTAGE))))
+        self._saved_fan_mode: FanMode | None = None
+        self._saved_refresh_mode: RefreshMode | None = None
+        self._auto_restore: bool = bool(self._cfg.get("auto_restore", True))
+        try:
+            saved_profile = parse_saved_profile(self._cfg)
+            self._saved_fan_mode = saved_profile.fan_mode
+            self._saved_refresh_mode = saved_profile.refresh_mode
+            self._auto_restore = saved_profile.auto_restore
+        except ValueError:
+            pass
         self._waiting_clean_exit = False
         self._pending_mode: FanMode | None = None
         self._mode_grace_until = 0.0
@@ -552,6 +596,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_combo = QtWidgets.QComboBox()
         for rm in RefreshMode:
             self.refresh_combo.addItem(f"{rm.interval_ms} ms", int(rm))
+        if self._saved_refresh_mode is not None:
+            idx = self.refresh_combo.findData(int(self._saved_refresh_mode))
+            if idx >= 0:
+                self.refresh_combo.blockSignals(True)
+                self.refresh_combo.setCurrentIndex(idx)
+                self.refresh_combo.blockSignals(False)
         self.refresh_combo.activated.connect(self._on_refresh_selected)
         param_row.addWidget(self.refresh_combo)
         right_col.addLayout(param_row)
@@ -598,7 +648,8 @@ class MainWindow(QtWidgets.QMainWindow):
         right_col.addWidget(fan_box, 1)
 
         self.energy_tab = EnergyTab(self._db_path)
-        self.settings_tab = SettingsTab(self._db_path)
+        self.settings_tab = SettingsTab(self._db_path, config_path=self._config_path)
+        self.settings_tab.auto_restore_changed.connect(self._on_auto_restore_changed)
         self.tabs.addTab(self.realtime_tab, "实时监控")
         self.tabs.addTab(self.energy_tab, "能耗统计")
         self.tabs.addTab(self.settings_tab, "设置")
@@ -608,7 +659,7 @@ class MainWindow(QtWidgets.QMainWindow):
         raw_pts = self._cfg.get("custom_curve")
         if isinstance(raw_pts, list) and len(raw_pts) == 5:
             try:
-                pts = [(int(p[0]), int(p[1])) for p in raw_pts]
+                pts = validate_fan_curve(raw_pts)
                 self.curve_widget.set_points(pts)
                 self.curve_info_label.setText(f"控制点: {pts}")
                 return
@@ -617,25 +668,70 @@ class MainWindow(QtWidgets.QMainWindow):
         self.curve_widget.set_points(DEFAULT_CUSTOM_POINTS)
 
     def _persist_config(self) -> None:
-        _save_local_config(
-            {
-                "fahrenheit": self._fahrenheit,
-                "sensor": int(self._sensor),
-                "custom_curve": [list(p) for p in self.curve_widget.points()],
-            },
-            path=self._config_path,
-        )
+        updates: dict[str, object] = {
+            "fahrenheit": self._fahrenheit,
+            "sensor": int(self._sensor),
+            "custom_curve": [list(p) for p in self.curve_widget.points()],
+            "auto_restore": self._auto_restore,
+        }
+        if self._saved_fan_mode in PERSISTABLE_FAN_MODES:
+            assert self._saved_fan_mode is not None
+            updates["fan_mode"] = self._saved_fan_mode.name.lower()
+        if self._saved_refresh_mode is not None:
+            updates["refresh_mode"] = self._saved_refresh_mode.interval_ms
+        try:
+            save_config(updates, path=self._config_path)
+        except OSError:
+            pass
+        if hasattr(self, "settings_tab"):
+            self.settings_tab.refresh_restore_summary()
+
+    def _build_restore_profile(self) -> SavedPsuProfile | None:
+        if not self._auto_restore:
+            return None
+        cfg = load_config(self._config_path, strict=False)
+        try:
+            profile = parse_saved_profile(cfg)
+        except ValueError:
+            return None
+        if not profile.auto_restore or not profile.has_device_settings:
+            return None
+        return profile
 
     def _start_worker(self) -> None:
         if not self._start_collector:
             self.port_label.setText("状态: 仅查看（未启动采集）")
             return
-        self._worker = TelemetryWorker(self.client, self._db_path, self)
+        restore_profile = self._build_restore_profile()
+        self._worker = TelemetryWorker(
+            self.client,
+            self._db_path,
+            self,
+            restore_profile=restore_profile,
+        )
         self._worker.state_changed.connect(self._on_collector_state)
         self._worker.info_updated.connect(self._on_info_updated)
         self._worker.status_updated.connect(self._on_status_updated)
         self._worker.error_occurred.connect(self._on_worker_error)
+        self._worker.restoring_mode.connect(self._on_restoring_mode)
+        self._worker.profile_restored.connect(self._on_profile_restored)
         self._worker.start()
+
+    @QtCore.Slot(bool)
+    def _on_auto_restore_changed(self, enabled: bool) -> None:
+        self._auto_restore = bool(enabled)
+
+    @QtCore.Slot(object)
+    def _on_restoring_mode(self, mode: FanMode) -> None:
+        self._pending_mode = mode
+        self._mode_grace_until = time.monotonic() + 3.5
+        if mode in self.mode_buttons:
+            self.mode_buttons[mode].setChecked(True)
+        self.curve_widget.set_editable(mode == FanMode.CUSTOM)
+
+    @QtCore.Slot(str)
+    def _on_profile_restored(self, message: str) -> None:
+        self.statusBar().showMessage(message, 6000)
 
     @QtCore.Slot(str)
     def _on_collector_state(self, text: str) -> None:
@@ -738,7 +834,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_refresh_selected(self, index: int) -> None:
         rate_val = self.refresh_combo.itemData(index)
         try:
-            self.client.set_refresh_mode(RefreshMode(int(rate_val)))
+            refresh = RefreshMode(int(rate_val))
+            self.client.set_refresh_mode(refresh)
+            self._saved_refresh_mode = refresh
+            self._persist_config()
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "设置失败", str(exc))
 
@@ -752,6 +851,9 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             pts = self.curve_widget.points() if mode == FanMode.CUSTOM else None
             self.client.set_fan_mode(mode, custom_points=pts)
+            if mode in PERSISTABLE_FAN_MODES:
+                self._saved_fan_mode = mode
+                self._persist_config()
         except Exception as exc:
             self._pending_mode = None
             QtWidgets.QMessageBox.warning(self, "风扇模式切换失败", str(exc))
@@ -773,8 +875,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.client.set_fan_curve(pts, switch_to_custom=True)
             self.mode_buttons[FanMode.CUSTOM].setChecked(True)
             self.curve_widget.set_editable(True)
+            self._saved_fan_mode = FanMode.CUSTOM
             self._persist_config()
-            self.statusBar().showMessage(f"已应用自定义曲线: {pts}", 3000)
+            self.statusBar().showMessage(f"已应用并保存自定义曲线: {pts}", 3000)
         except Exception as exc:
             self._pending_mode = None
             QtWidgets.QMessageBox.warning(self, "下发曲线失败", str(exc))

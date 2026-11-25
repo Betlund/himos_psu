@@ -4,14 +4,26 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import sys
 import time
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Sequence
 
 from .client import PowerSupplyClient
-from .collector import Collector, CollectorBusy
+from .collector import Collector, CollectorBusy, collector_lock
+from .config import (
+    PERSISTABLE_FAN_MODES,
+    apply_profile_to_client,
+    default_config_path,
+    load_saved_profile,
+    persist_device_settings,
+    plan_profile_frames,
+)
 from .energy import (
+    DEFAULT_DB,
     EnergyStore,
     TariffPlan,
     fixed_plan,
@@ -32,7 +44,7 @@ from .protocol import (
     format_warranty_badge,
     summary_dict,
 )
-from .transport import discover_serial_ports
+from .transport import discover_serial_ports, resolve_default_port
 
 UDEV_RULE = 'SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", MODE="0666"\n'
 
@@ -169,12 +181,20 @@ def _cmd_watch(args: argparse.Namespace) -> int:
 
 def _cmd_fan_mode(args: argparse.Namespace) -> int:
     mode = FanMode.from_name(args.mode)
+    if args.save and mode not in PERSISTABLE_FAN_MODES:
+        raise ValueError(f"模式 {mode.label} 为一次性模式，不允许持久化保存")
     points = args.curve if mode == FanMode.CUSTOM else None
     if mode == FanMode.CUSTOM and points is None:
         points = list(DEFAULT_CUSTOM_POINTS)
     with PowerSupplyClient(port=args.port, mock=args.mock, verify_crc=not args.no_crc_check) as client:
         client.set_fan_mode(mode, custom_points=points)
         print(f"已发送风扇模式指令: {mode.label} (id={int(mode)})")
+    if args.save:
+        if mode == FanMode.CUSTOM and points is not None:
+            saved = persist_device_settings(fan_mode=mode, custom_curve=points, path=args.config)
+        else:
+            saved = persist_device_settings(fan_mode=mode, path=args.config)
+        print(f"已保存配置到: {saved}")
     return 0
 
 
@@ -186,6 +206,12 @@ def _cmd_fan_curve(args: argparse.Namespace) -> int:
         print(f"已下发自定义风扇曲线控制点: {curve}")
         print(f"21 档 PWM 占空比(%): {list(raw_27[:21])}")
         print(f"TX 帧 ({len(frame)}B): {frame.hex(' ')}")
+    if args.save:
+        if args.no_mode_switch:
+            saved = persist_device_settings(custom_curve=curve, path=args.config)
+        else:
+            saved = persist_device_settings(fan_mode=FanMode.CUSTOM, custom_curve=curve, path=args.config)
+        print(f"已保存配置到: {saved}")
     return 0
 
 
@@ -194,6 +220,154 @@ def _cmd_refresh_rate(args: argparse.Namespace) -> int:
     with PowerSupplyClient(port=args.port, mock=args.mock, verify_crc=not args.no_crc_check) as client:
         frame = client.set_refresh_mode(refresh)
         print(f"已设置刷新速率: {refresh.interval_ms} ms (index={int(refresh)}), TX={frame.hex(' ')}")
+    if args.save:
+        saved = persist_device_settings(refresh_mode=refresh, path=args.config)
+        print(f"已保存配置到: {saved}")
+    return 0
+
+
+def _wait_for_port(port: str | None, wait_s: float) -> str:
+    deadline = time.monotonic() + max(0.0, wait_s)
+    last_err: Exception | None = None
+    while True:
+        try:
+            resolved = resolve_default_port(port)
+            if os.path.exists(resolved) and os.access(resolved, os.R_OK | os.W_OK):
+                return resolved
+            last_err = PermissionError(f"串口不可访问或尚未就绪: {resolved}")
+        except FileNotFoundError as exc:
+            last_err = exc
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            if last_err is not None:
+                raise last_err
+            raise TimeoutError(f"等待串口就绪超时 ({wait_s:.1f}s)")
+        time.sleep(min(0.5, remaining))
+
+
+def _cmd_apply_saved(args: argparse.Namespace) -> int:
+    cfg_path = args.config if args.config is not None else default_config_path()
+    profile = load_saved_profile(cfg_path)
+    if profile is None or not profile.has_device_settings:
+        if not args.quiet:
+            print(f"未发现已保存的风扇/刷新配置 ({cfg_path})，跳过下发。")
+        return 0
+    if not profile.auto_restore and not args.force:
+        if not args.quiet:
+            print("auto_restore 已禁用，跳过下发（可加 --force 强制应用）。")
+        return 0
+
+    plan = plan_profile_frames(profile)
+    if args.dry_run:
+        print(f"配置文件: {cfg_path}")
+        if profile.fan_mode is not None:
+            print(f"计划恢复模式: {profile.fan_mode.label} (id={int(profile.fan_mode)})")
+        if profile.custom_curve is not None and profile.fan_mode == FanMode.CUSTOM:
+            print(f"计划恢复曲线: {list(profile.custom_curve)}")
+            if plan.curve_frame is not None:
+                print(f"21 档 PWM 占空比(%): {list(plan.curve_frame[4:25])}")
+        if profile.refresh_mode is not None:
+            print(f"计划刷新间隔: {profile.refresh_mode.interval_ms} ms")
+        if plan.refresh_frame is not None:
+            print(f"TX 刷新周期帧 (8B): {plan.refresh_frame.hex(' ')}")
+        if plan.mode_frame is not None:
+            print(f"TX 风扇模式帧 (8B): {plan.mode_frame.hex(' ')}")
+        if plan.curve_frame is not None:
+            print(f"TX 自定义曲线帧 ({len(plan.curve_frame)}B): {plan.curve_frame.hex(' ')}")
+        print("dry-run 完成：未打开串口，未向电源发送任何数据。")
+        return 0
+
+    db_path = Path(args.db or os.environ.get("HIMOS_PSU_DB") or DEFAULT_DB)
+    lock_path = db_path.parent / "collector.lock"
+    use_lock = (not args.mock) or (args.db is not None)
+
+    def _run_apply() -> int:
+        target_port = args.port
+        if not args.mock and args.wait_port > 0:
+            target_port = _wait_for_port(args.port, args.wait_port)
+        with PowerSupplyClient(port=target_port, mock=args.mock, verify_crc=not args.no_crc_check) as client:
+            initial_status = client.wait_for_status(timeout=args.timeout)
+            res = apply_profile_to_client(
+                client,
+                profile,
+                initial_status=initial_status,
+                force=args.force,
+                if_needed=args.if_needed,
+                confirm_timeout=args.timeout,
+            )
+        if res.skipped_reason.startswith("fault_code:"):
+            code = res.skipped_reason.split(":", 1)[1]
+            print(f"警告: 电源存在锁存故障码 ({code})，出于安全已跳过自动恢复（可用 --force 强制覆盖）。", file=sys.stderr)
+            return 1
+        if not res.applied:
+            if not args.quiet:
+                mode_str = res.initial_mode.label if res.initial_mode is not None else "unknown"
+                print(f"跳过下发（原因: {res.skipped_reason or '无需变更'}，当前模式: {mode_str}）。")
+            return 0
+        if not args.quiet:
+            actions: list[str] = []
+            if res.sent_refresh and profile.refresh_mode is not None:
+                actions.append(f"刷新={profile.refresh_mode.interval_ms}ms")
+            if res.sent_mode and profile.fan_mode is not None:
+                actions.append(f"模式={profile.fan_mode.label}")
+            if res.sent_curve:
+                actions.append("自定义曲线")
+            print(f"已恢复已保存配置 ({', '.join(actions)})。")
+        if profile.fan_mode is not None and res.confirmed_mode != profile.fan_mode:
+            seen = res.confirmed_mode.label if res.confirmed_mode is not None else "无"
+            print(
+                f"警告: 指令已发送，但在 {args.timeout:.1f}s 内未收到电源切至 {profile.fan_mode.label} 的遥测确认（最后回报: {seen}）。",
+                file=sys.stderr,
+            )
+        elif not args.quiet and res.confirmed_mode is not None:
+            print(f"已确认电源当前模式: {res.confirmed_mode.label}")
+        return 0
+
+    if not use_lock:
+        return _run_apply()
+    try:
+        with collector_lock(lock_path):
+            return _run_apply()
+    except CollectorBusy as exc:
+        if args.skip_if_busy:
+            if not args.quiet:
+                print(f"串口已被其他采集进程占用，跳过本次下发: {exc}")
+            return 0
+        raise
+
+
+def _default_systemd_exec() -> str:
+    repo_bin = Path(__file__).resolve().parents[2] / "bin" / "himos-psu"
+    if repo_bin.is_file():
+        candidate = str(repo_bin)
+    else:
+        which_bin = shutil.which("himos-psu")
+        candidate = which_bin if which_bin else f"{sys.executable} -m himos_psu"
+    home_str = str(Path.home())
+    if candidate == home_str or candidate.startswith(home_str + os.sep):
+        candidate = "%h" + candidate[len(home_str):]
+    return candidate
+
+
+def _cmd_systemd_unit(args: argparse.Namespace) -> int:
+    exec_bin = args.exec.strip() if args.exec else _default_systemd_exec()
+    home_str = str(Path.home())
+    if exec_bin == home_str or exec_bin.startswith(home_str + os.sep):
+        exec_bin = "%h" + exec_bin[len(home_str):]
+    wait_arg = f"{max(0.0, args.wait_port):g}"
+    unit = (
+        "[Unit]\n"
+        "Description=Restore saved HiMOS PSU fan curve and mode on boot\n"
+        "\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        f"ExecStart={exec_bin} apply-saved --wait-port {wait_arg} --skip-if-busy\n"
+        "TimeoutStartSec=30\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=default.target\n"
+    )
+    sys.stdout.write(unit)
     return 0
 
 
@@ -407,19 +581,43 @@ def build_parser() -> argparse.ArgumentParser:
     p_watch.add_argument("--json", action="store_true")
     p_watch.set_defaults(func=_cmd_watch)
 
+    # Shared connection flags accepted both before and after subcommands like gui / apply-saved.
+    conn_flags = argparse.ArgumentParser(add_help=False)
+    conn_flags.add_argument("-p", "--port", default=argparse.SUPPRESS, help="串口路径")
+    conn_flags.add_argument("--mock", action="store_true", default=argparse.SUPPRESS, help="离线模拟设备")
+    conn_flags.add_argument("--no-crc-check", action="store_true", default=argparse.SUPPRESS, help="不校验 CRC")
+
     p_mode = sub.add_parser("fan-mode", help="设置风扇模式: auto/silent/performance/custom/clean")
     p_mode.add_argument("mode", help="目标风扇模式")
     p_mode.add_argument("--curve", nargs=5, type=_parse_point, metavar="T,D", help="当 mode=custom 时一并下发 5 个点")
+    p_mode.add_argument("--save", action="store_true", help="同时保存到 settings.json（不支持 clean）")
+    p_mode.add_argument("--config", type=Path, help="配置文件路径（默认 ~/.config/himos-psu/settings.json）")
     p_mode.set_defaults(func=_cmd_fan_mode)
 
     p_curve = sub.add_parser("fan-curve", help="设置自定义 5 点风扇曲线 (例如: 0,0 40,20 60,30 80,70 100,100)")
     p_curve.add_argument("points", nargs=5, type=_parse_point, metavar="T,D")
     p_curve.add_argument("--no-mode-switch", action="store_true", help="只发送 0x1B 曲线而不预先发送 Custom 模式")
+    p_curve.add_argument("--save", action="store_true", help="同时保存曲线与模式到 settings.json")
+    p_curve.add_argument("--config", type=Path, help="配置文件路径（默认 ~/.config/himos-psu/settings.json）")
     p_curve.set_defaults(func=_cmd_fan_curve)
 
     p_rate = sub.add_parser("refresh-rate", help="设置电源遥测主动推送间隔 (1000/1500/2000/2500/3000ms)")
     p_rate.add_argument("rate")
+    p_rate.add_argument("--save", action="store_true", help="同时保存到 settings.json")
+    p_rate.add_argument("--config", type=Path, help="配置文件路径（默认 ~/.config/himos-psu/settings.json）")
     p_rate.set_defaults(func=_cmd_refresh_rate)
+
+    p_apply = sub.add_parser("apply-saved", parents=[conn_flags], help="从本地配置安全恢复上次保存的风扇模式/曲线")
+    p_apply.add_argument("--config", type=Path, help="配置文件路径（默认 ~/.config/himos-psu/settings.json）")
+    p_apply.add_argument("--db", help="能耗数据库路径（用于定位 collector.lock）")
+    p_apply.add_argument("--dry-run", action="store_true", help="仅校验并打印计划下发的帧，不打开串口")
+    p_apply.add_argument("--if-needed", action="store_true", help="仅当电源当前模式与保存值不一致时才下发")
+    p_apply.add_argument("--force", action="store_true", help="忽略 auto_restore=false、同模式跳过或锁存故障码保护")
+    p_apply.add_argument("--wait-port", type=float, default=0.0, help="等待串口就绪的最大秒数（开机服务可用 15）")
+    p_apply.add_argument("--skip-if-busy", action="store_true", help="若串口已被 GUI 或 collect 占用则静默退出 0")
+    p_apply.add_argument("--timeout", type=float, default=4.0, help="等待初始状态与切换确认的超时秒数")
+    p_apply.add_argument("--quiet", action="store_true", help="成功或跳过时减少输出")
+    p_apply.set_defaults(func=_cmd_apply_saved)
 
     p_clear = sub.add_parser("clear-fault", help="清除电源锁存故障码 (0x1E)")
     p_clear.set_defaults(func=_cmd_clear_fault)
@@ -470,14 +668,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_udev = sub.add_parser("udev-rule", help="打印无需 root 访问 CH340 串口的 udev 规则示例")
     p_udev.set_defaults(func=lambda _: (sys.stdout.write(UDEV_RULE), 0)[1])
 
-    # `himos-psu-gui --mock` expands to `himos-psu gui --mock`, so the gui subcommand must
-    # accept the global connection flags too; SUPPRESS keeps values given before "gui" intact.
-    gui_flags = argparse.ArgumentParser(add_help=False)
-    gui_flags.add_argument("-p", "--port", default=argparse.SUPPRESS, help="串口路径")
-    gui_flags.add_argument("--mock", action="store_true", default=argparse.SUPPRESS, help="离线模拟设备")
-    gui_flags.add_argument("--no-crc-check", action="store_true", default=argparse.SUPPRESS, help="不校验 CRC")
+    p_systemd = sub.add_parser("systemd-unit", help="打印开机自动恢复电源配置的 systemd --user 服务单元")
+    p_systemd.add_argument("--exec", help="自定义 himos-psu 可执行路径")
+    p_systemd.add_argument("--wait-port", type=float, default=15.0, help="启动时等待串口就绪的最大秒数（默认 15）")
+    p_systemd.set_defaults(func=_cmd_systemd_unit)
 
-    p_gui = sub.add_parser("gui", parents=[gui_flags], help="启动 PySide6 桌面控制面板")
+    p_gui = sub.add_parser("gui", parents=[conn_flags], help="启动 PySide6 桌面控制面板")
     p_gui.set_defaults(func=_cmd_gui)
 
     return parser

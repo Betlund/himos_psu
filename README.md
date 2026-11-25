@@ -53,12 +53,34 @@ git clone https://github.com/Betlund/himos_psu.git && cd himos_psu
 
 # 切换风扇模式 (auto / silent / performance / custom / clean)
 ./bin/himos-psu fan-mode silent
+./bin/himos-psu fan-mode custom --curve 0,0 40,20 60,30 80,70 100,100 --save
 
-# 下发自定义 5 点温控曲线 (温度%,占空比%)
-./bin/himos-psu fan-curve 0,0 40,20 60,30 80,70 100,100
+# 下发自定义 5 点温控曲线 (温度%,占空比%)，加 --save 可同步保存到本地配置
+./bin/himos-psu fan-curve 0,0 40,20 60,30 80,70 100,100 --save
+
+# 检查/从本地配置安全恢复风扇模式与曲线（--dry-run 仅打印不写串口）
+./bin/himos-psu apply-saved --dry-run
 
 # 启动 PySide6 桌面控制面板（离线体验可追加 --mock）
 ./bin/himos-psu-gui
+```
+
+## 开机自动恢复自定义风扇曲线
+
+鑫谷 / 昆仑 HiMOS 电源的 MCU **不会掉电保存自定义风扇模式与曲线**（协议本身也没有写入 Flash 的指令，每次电脑冷启动或断电重启后都会复位为出厂 `Auto`）。原厂 Windows 上位机依赖后台开机自启在连接串口时重新下发配置；本工具在 Linux 下提供对应的本地持久化与自动恢复机制：
+
+- **本地持久化与重连恢复**：在 GUI 中切换风扇模式（`Auto` / `Silent` / `Performance` / `Custom`；一次性的 `Clean` 除外）、点击「应用自定义曲线」或调整刷新周期后，会自动将配置原子写入 `~/.config/himos-psu/settings.json`。此后每次打开 GUI 并收到电源首帧状态遥测后，会自动恢复上次保存的模式与曲线（可在「设置」页开关）。
+- **无 GUI 开机自动恢复（`systemd --user`）**：不常驻打开 GUI 时，可安装一次性用户级服务，开机等待串口就绪后安全下发一次即退出：
+
+```bash
+# 1. 先离线检查即将下发的配置与 21 档 PWM 占空比（不碰串口）
+./bin/himos-psu apply-saved --dry-run
+
+# 2. 生成并启用 systemd 用户服务（串口若已被 GUI/collect 占用会自动跳过）
+mkdir -p ~/.config/systemd/user
+./bin/himos-psu systemd-unit > ~/.config/systemd/user/himos-psu-restore.service
+systemctl --user daemon-reload
+systemctl --user enable himos-psu-restore.service
 ```
 
 ## 能耗统计

@@ -11,6 +11,7 @@ from typing import Any, Sequence
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from .config import default_config_path, load_config, parse_saved_profile, save_config
 from .energy import (
     CN_TOU_PRESET,
     EnergyStore,
@@ -23,6 +24,7 @@ from .energy import (
     local_day_start,
     parse_band_spec,
 )
+from .protocol import FanMode
 
 BG = "#0d1117"
 PANEL = "#11161d"
@@ -892,13 +894,33 @@ class EnergyTab(QtWidgets.QWidget):
 
 # --------------------------------------------------------------------------- settings tab
 class SettingsTab(QtWidgets.QWidget):
-    def __init__(self, db_path: str | Path, parent: QtWidgets.QWidget | None = None) -> None:
+    auto_restore_changed = QtCore.Signal(bool)
+
+    def __init__(
+        self,
+        db_path: str | Path,
+        parent: QtWidgets.QWidget | None = None,
+        *,
+        config_path: Path | None = None,
+    ) -> None:
         super().__init__(parent)
         self.db_path = Path(db_path)
+        self.config_path = Path(config_path) if config_path is not None else default_config_path()
         self._state = "未启动"
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(12, 10, 12, 10)
         root.setSpacing(10)
+
+        restore_box = QtWidgets.QGroupBox("风扇配置持久化与启动恢复")
+        restore_layout = QtWidgets.QVBoxLayout(restore_box)
+        self.auto_restore_check = QtWidgets.QCheckBox("连接电源时自动恢复上次保存的风扇模式与自定义曲线")
+        self.auto_restore_check.toggled.connect(self._on_auto_restore_toggled)
+        restore_layout.addWidget(self.auto_restore_check)
+        self.restore_summary_label = QtWidgets.QLabel("--")
+        self.restore_summary_label.setWordWrap(True)
+        self.restore_summary_label.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        restore_layout.addWidget(self.restore_summary_label)
+        root.addWidget(restore_box)
 
         plan_box = QtWidgets.QGroupBox("电价方案")
         plan_layout = QtWidgets.QVBoxLayout(plan_box)
@@ -972,7 +994,45 @@ class SettingsTab(QtWidgets.QWidget):
         self._state = text
         self.refresh()
 
+    def refresh_restore_summary(self) -> None:
+        cfg = load_config(self.config_path, strict=False)
+        enabled = bool(cfg.get("auto_restore", True))
+        self.auto_restore_check.blockSignals(True)
+        self.auto_restore_check.setChecked(enabled)
+        self.auto_restore_check.blockSignals(False)
+        try:
+            profile = parse_saved_profile(cfg)
+        except ValueError as exc:
+            self.restore_summary_label.setText(f"已保存配置校验异常（已禁止自动下发）：{exc}")
+            return
+        parts: list[str] = []
+        if profile.fan_mode is not None:
+            parts.append(f"模式={profile.fan_mode.label}")
+            if profile.fan_mode == FanMode.CUSTOM and profile.custom_curve is not None:
+                parts.append(f"曲线={[list(pt) for pt in profile.custom_curve]}")
+        if profile.refresh_mode is not None:
+            parts.append(f"刷新={profile.refresh_mode.interval_ms} ms")
+        if parts:
+            self.restore_summary_label.setText(
+                f"已保存配置：{' · '.join(parts)}\n"
+                "电源断电/重启后固件会自动复位为 Auto；开启此项后，每次启动软件或开机服务都会在确认遥测正常后自动恢复。"
+            )
+        else:
+            self.restore_summary_label.setText(
+                "已保存配置：尚未记录风扇模式（切换风扇模式或点击「应用自定义曲线」后将自动保存；"
+                "一次性清灰 Clean 不会被记录）。"
+            )
+
+    def _on_auto_restore_toggled(self, checked: bool) -> None:
+        try:
+            save_config({"auto_restore": bool(checked)}, path=self.config_path)
+        except OSError as exc:
+            self.state_label.setText(f"保存设置失败：{exc}")
+        self.auto_restore_changed.emit(bool(checked))
+        self.refresh_restore_summary()
+
     def refresh(self) -> None:
+        self.refresh_restore_summary()
         store = None
         try:
             store = EnergyStore(self.db_path)

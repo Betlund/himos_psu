@@ -4,8 +4,15 @@
 
 ## [Unreleased]
 
+### 新增
+
+- 风扇配置持久化与启动自动恢复：新增 `config.py`，在 GUI 切换模式（排除一次性 `Clean`）、点击「应用自定义曲线」或调节刷新周期时将配置原子写入 `~/.config/himos-psu/settings.json`。
+- GUI 重连自动恢复与设置开关：连接电源并收到首帧校验通过的 `0x02` 遥测后自动按序重推模式与曲线（存在锁存故障码时自动跳过），「设置」页新增自动恢复开关与配置摘要。
+- CLI 新增 `apply-saved`（支持 `--dry-run` / `--if-needed` / `--force` / `--wait-port` / `--skip-if-busy`）、`systemd-unit` 以及 `fan-mode` / `fan-curve` / `refresh-rate` 的 `--save` 参数，方便通过 `systemd --user` 在开机时无 GUI 恢复曲线。
+
 ### 修复
 
+- `PowerSupplyClient.set_fan_mode()` 改为在发送 `0x13` 切模式之前先校验并预构建 `0x1B` 曲线帧，避免非法曲线在切模式后抛出异常、发送半套指令；连续帧间隔默认设为 `0.15s`。
 - GUI 冒烟测试原先按固定的「今天 10:00」写入样本，在 UTC 时区且还没到 10 点的 CI
   runner 上会被「今日」区间排除、断言失败；改为相对当前时刻生成样本。
 
