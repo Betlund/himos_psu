@@ -30,6 +30,10 @@ class CollectorBusy(RuntimeError):
     """Another process already owns the PSU / energy database."""
 
 
+class StaleError(RuntimeError):
+    """No telemetry for ``stale_timeout`` seconds; the caller should restart."""
+
+
 def _acquire_lock_fd(lock_path: Path) -> int:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
@@ -93,23 +97,27 @@ class Collector:
         *,
         lock_path: str | Path | None = None,
         on_status: Callable[[PowerStatus], None] | None = None,
+        on_frame: Callable[[object, object], None] | None = None,
         on_first_status: Callable[[PowerSupplyClient, PowerStatus], None] | None = None,
         on_specs: Callable[[PowerInfo | None, str], None] | None = None,
         on_state: Callable[[str], None] | None = None,
         poll_timeout: float = 0.2,
         prune_interval: float = 6 * 3600.0,
         session_gap: float = SESSION_GAP_S,
+        stale_timeout: float = 0.0,
     ) -> None:
         self.client = client
         self.store = store
         self.lock_path = Path(lock_path) if lock_path else store.path.parent / "collector.lock"
         self.on_status = on_status
+        self.on_frame = on_frame
         self.on_first_status = on_first_status
         self.on_specs = on_specs
         self.on_state = on_state
         self.poll_timeout = poll_timeout
         self.prune_interval = prune_interval
         self.session_gap = session_gap
+        self.stale_timeout = float(stale_timeout)
         self.stats = CollectorStats()
         self._lock_fd: int | None = None
 
@@ -143,7 +151,7 @@ class Collector:
             self.client.open()
             self._emit_state(f"已连接 {self.client.port_name}")
             try:
-                info, sn = self.client.query_specs_and_sn(timeout=2.0)
+                info, sn = self.client.query_specs_and_sn(timeout=2.0, on_frame=self.on_frame)
                 if self.on_specs is not None and (info is not None or sn):
                     self.on_specs(info, sn)
             except Exception:
@@ -151,9 +159,21 @@ class Collector:
             self._emit_state("采集中")
             next_prune = time.monotonic() + self.prune_interval
             first_status_seen = False
+            last_frame = time.monotonic()
             while not stop():
                 events = self.client.poll_frames(timeout=self.poll_timeout)
-                for _raw, parsed in events:
+                if events:
+                    last_frame = time.monotonic()
+                elif self.stale_timeout > 0 and time.monotonic() - last_frame > self.stale_timeout:
+                    raise StaleError(
+                        f"{self.stale_timeout:.0f}s 内没有收到任何遥测帧，串口可能已失效（休眠/重新枚举）"
+                    )
+                for raw, parsed in events:
+                    if self.on_frame is not None:
+                        try:
+                            self.on_frame(raw, parsed)
+                        except Exception:
+                            pass
                     if isinstance(parsed, PowerStatus):
                         stamp = time.time()
                         ws, gap = self.store.add_sample(stamp, parsed)

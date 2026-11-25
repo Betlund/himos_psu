@@ -320,11 +320,13 @@ class EnergyStore:
             if not self.path.is_file():
                 raise FileNotFoundError(f"能耗数据库不存在：{self.path}")
             uri = f"file:{self.path}?mode=ro"
-            self._conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+            # check_same_thread=False: the daemon builds the store on its main thread
+            # and the collector thread writes through it; SQLite serialises internally.
+            self._conn = sqlite3.connect(uri, uri=True, timeout=5.0, check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
         else:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self._conn = sqlite3.connect(self.path, timeout=5.0)
+            self._conn = sqlite3.connect(self.path, timeout=5.0, check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")

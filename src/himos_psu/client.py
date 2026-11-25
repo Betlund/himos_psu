@@ -110,7 +110,11 @@ class PowerSupplyClient:
                 break
         return collected
 
-    def query_specs_and_sn(self, timeout: float = 2.0) -> tuple[PowerInfo | None, str]:
+    def query_specs_and_sn(
+        self,
+        timeout: float = 2.0,
+        on_frame: Callable[[RawFrame, Any], None] | None = None,
+    ) -> tuple[PowerInfo | None, str]:
         """Run both POWER_INFO(sub=0) and POWER_INFO(sub=53) matching HiMOS startup.
 
         sub=0 populates manufacture (e.g. 'segotep') + SN; sub=53 populates build date (year/month/day).
@@ -118,17 +122,21 @@ class PowerSupplyClient:
         with self._lock:
             self.transport.flush_input()
             self.transport.write(build_info_request_frame(0))
-        self.collect_until(
+        for raw, parsed in self.collect_until(
             lambda: bool(self.sn and self.info and self.info.manufacture),
             timeout=timeout / 2,
-        )
+        ):
+            if on_frame is not None:
+                on_frame(raw, parsed)
 
         with self._lock:
             self.transport.write(build_info_request_frame(53))
-        self.collect_until(
+        for raw, parsed in self.collect_until(
             lambda: bool(self.info and (self.info.year or self.info.month or self.info.day)),
             timeout=timeout / 2,
-        )
+        ):
+            if on_frame is not None:
+                on_frame(raw, parsed)
         return self.info, self.sn
 
     def wait_for_status(self, timeout: float = 3.5) -> PowerStatus:

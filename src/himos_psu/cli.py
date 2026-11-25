@@ -13,7 +13,8 @@ from pathlib import Path
 from typing import Sequence
 
 from .client import PowerSupplyClient
-from .collector import Collector, CollectorBusy, collector_lock
+from .collector import Collector, CollectorBusy, StaleError, collector_lock
+from .daemon import Daemon
 from .config import (
     PERSISTABLE_FAN_MODES,
     apply_profile_to_client,
@@ -349,6 +350,62 @@ def _default_systemd_exec() -> str:
     return candidate
 
 
+def _cmd_daemon(args: argparse.Namespace) -> int:
+    """Run the background collector daemon (owns the serial port, serves IPC)."""
+    from .collector import CollectorBusy as _Busy
+    from .ipc import default_socket_path
+
+    socket_path = Path(args.socket) if args.socket else default_socket_path()
+
+    def log(text: str) -> None:
+        if not args.quiet:
+            print(f"[{time.strftime('%H:%M:%S')}] {text}", flush=True)
+
+    daemon = Daemon(
+        db_path=args.db,
+        socket_path=socket_path,
+        port=args.port,
+        mock=args.mock,
+        restore=not args.no_restore,
+        wait_port=args.wait_port,
+        stale_timeout=args.stale_timeout,
+        config_path=args.config,
+        quiet=args.quiet,
+        on_log=log,
+    )
+    try:
+        return daemon.run()
+    except _Busy as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 1
+
+
+def _cmd_systemd_daemon(args: argparse.Namespace) -> int:
+    exec_bin = args.exec.strip() if args.exec else _default_systemd_exec()
+    home_str = str(Path.home())
+    if exec_bin == home_str or exec_bin.startswith(home_str + os.sep):
+        exec_bin = "%h" + exec_bin[len(home_str):]
+    unit = (
+        "[Unit]\n"
+        "Description=HiMOS PSU background collector (serial owner + IPC daemon)\n"
+        "After=default.target\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"ExecStart={exec_bin} daemon --wait-port {max(0.0, args.wait_port):g}"
+        f" --stale-timeout {max(0.0, args.stale_timeout):g} --quiet\n"
+        "Restart=always\n"
+        "RestartSec=5\n"
+        "StartLimitIntervalSec=300\n"
+        "StartLimitBurst=10\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=default.target\n"
+    )
+    sys.stdout.write(unit)
+    return 0
+
+
 def _cmd_systemd_unit(args: argparse.Namespace) -> int:
     exec_bin = args.exec.strip() if args.exec else _default_systemd_exec()
     home_str = str(Path.home())
@@ -533,12 +590,18 @@ def _cmd_collect(args: argparse.Namespace) -> int:
               f"{format_kwh(collector.stats.kwh)} kWh · {collector.stats.samples} 样本"
               + (f" · 缺口 {collector.stats.gaps} 次" if collector.stats.gaps else ""), flush=True)
 
-    collector = Collector(client, store, on_state=on_state, on_status=on_status)
+    collector = Collector(
+        client, store, on_state=on_state, on_status=on_status,
+        stale_timeout=getattr(args, "stale_timeout", 0.0),
+    )
     try:
         collector.run()
     except KeyboardInterrupt:
         pass
     except CollectorBusy as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 1
+    except StaleError as exc:
         print(f"错误: {exc}", file=sys.stderr)
         return 1
     finally:
@@ -660,10 +723,31 @@ def build_parser() -> argparse.ArgumentParser:
     p_tr = tsub.add_parser("recalc", help="按当前生效方案重算历史费用")
     p_tr.set_defaults(func=_cmd_tariff_recalc)
 
-    p_collect = sub.add_parser("collect", help="前台采集能耗数据（Ctrl+C 停止；与 GUI 互斥）")
+    p_collect = sub.add_parser("collect", help="前台采集能耗数据（Ctrl+C 停止；与 GUI/守护进程互斥）")
     p_collect.add_argument("--db", help="能耗数据库路径")
     p_collect.add_argument("--quiet", action="store_true", help="不打印进度")
+    p_collect.add_argument("--stale-timeout", type=float, default=0.0,
+                           help="超过 N 秒收不到帧就退出（供 systemd 重启；0=不检查）")
     p_collect.set_defaults(func=_cmd_collect)
+
+    p_daemon = sub.add_parser("daemon", help="后台采集守护进程（独占串口，GUI 通过 IPC 连它）")
+    p_daemon.add_argument("--db", help="能耗数据库路径")
+    p_daemon.add_argument("--socket", help="IPC 套接字路径（默认 $XDG_RUNTIME_DIR/himos-psu/daemon.sock）")
+    p_daemon.add_argument("--config", type=Path, help="配置文件路径")
+    p_daemon.add_argument("-p", "--port", help="串口路径")
+    p_daemon.add_argument("--mock", action="store_true", help="离线模拟设备")
+    p_daemon.add_argument("--no-restore", action="store_true", help="连接后不恢复保存的风扇配置")
+    p_daemon.add_argument("--wait-port", type=float, default=0.0, help="等待串口就绪的最大秒数")
+    p_daemon.add_argument("--stale-timeout", type=float, default=0.0,
+                          help="超过 N 秒收不到帧就退出（生产环境建议 180）")
+    p_daemon.add_argument("--quiet", action="store_true", help="不打印进度")
+    p_daemon.set_defaults(func=_cmd_daemon)
+
+    p_sysd = sub.add_parser("systemd-daemon", help="打印后台采集守护进程的 systemd --user 单元")
+    p_sysd.add_argument("--exec", help="自定义 himos-psu 可执行路径")
+    p_sysd.add_argument("--wait-port", type=float, default=30.0, help="启动时等待串口就绪的秒数")
+    p_sysd.add_argument("--stale-timeout", type=float, default=180.0, help="无数据多久后重启")
+    p_sysd.set_defaults(func=_cmd_systemd_daemon)
 
     p_udev = sub.add_parser("udev-rule", help="打印无需 root 访问 CH340 串口的 udev 规则示例")
     p_udev.set_defaults(func=lambda _: (sys.stdout.write(UDEV_RULE), 0)[1])

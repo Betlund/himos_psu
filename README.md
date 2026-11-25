@@ -37,6 +37,7 @@ git clone https://github.com/Betlund/himos_psu.git && cd himos_psu
   - 完整解析 `+3.3V / +5V / +12V / +5VSB`、`输入功率 / 输入电压 / 频率`、高压区 / 低压区 / 环境三路温度、风扇转速与故障码。
   - 严格复刻 `ControlChart` 与 `x9` 分段线性重采样生成 27 字节自定义温控风扇曲线。
 - **CLI + PySide6 原生桌面 GUI**：命令行实时监控、JSON 输出、原始十六进制嗅探；GUI 分「实时监控 / 能耗统计 / 设置」三页，含 5 点可拖拽风扇曲线编辑器。
+- **后台采集守护进程**：独占串口的 systemd 用户服务，24/7 写库；GUI 通过 Unix socket IPC 跟随，可边采集边调速。
 - **能耗统计**：后台采集并把输入功率积分成 kWh，支持固定电价与峰谷（尖/峰/平/谷）电价、今日/本周/本月/今年报表、月历热力图、负载率分布、供电会话、CSV/JSON 导出与改价重算历史费用。
 
 ## 命令行
@@ -104,6 +105,40 @@ systemctl --user enable himos-psu-restore.service
 
 GUI 的「能耗统计」页会随采集自动刷新；采集进程与 GUI **互斥**（串口被 `TIOCEXCL` 独占），
 同时启动时第二个进程会明确提示，而不会静默失败。
+
+### 后台常驻采集（守护进程）
+
+默认只有 GUI 打开时才采集。想让统计连续（只要电脑开着就记录），把采集跑成用户级守护进程：
+
+```bash
+# 1. 先手动试跑，确认能连上电源（Ctrl+C 停止）
+./bin/himos-psu daemon
+
+# 2. 装成 systemd --user 服务
+mkdir -p ~/.config/systemd/user
+./bin/himos-psu systemd-daemon > ~/.config/systemd/user/himos-psu-collect.service
+systemctl --user daemon-reload
+systemctl --user enable --now himos-psu-collect.service
+systemctl --user status himos-psu-collect.service
+```
+
+守护进程独占串口并 24/7 写 `energy.db`。**GUI 启动时如果发现守护进程在运行，会自动通过
+Unix socket 跟随它**（默认 `$XDG_RUNTIME_DIR/himos-psu/daemon.sock`，可用 `HIMOS_PSU_SOCKET`
+覆盖），实时数据与风扇调速照常可用——不需要先关服务，也不会因为串口被占而报错。
+
+- 连接后自动恢复保存的风扇配置，等价于原来的 `himos-psu-restore.service`，后者可以退役
+- 超过 `--stale-timeout`（单元里默认 180 秒）收不到遥测会自动退出，由 systemd 重启；
+  这是应对休眠唤醒后 USB 重新枚举的方式
+- 想「开机就采、不必登录」，需要 `loginctl enable-linger $USER`
+- 只想临时采集仍可用 `./bin/himos-psu collect`（与守护进程/GUI 互斥）
+
+从旧的恢复服务迁移：
+
+```bash
+systemctl --user disable --now himos-psu-restore.service
+rm ~/.config/systemd/user/himos-psu-restore.service
+systemctl --user daemon-reload
+```
 
 ### 统计口径与边界
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 from collections import deque
 from pathlib import Path
@@ -32,13 +33,18 @@ from .fan_curve import (
     validate_fan_curve,
 )
 from .gui_energy import CARD_QSS, EnergyTab, SettingsTab
+from .ipc import DaemonUnavailable, IpcError, SocketClient, default_socket_path, probe_socket
 from .protocol import (
     FanMode,
     PowerInfo,
+    PowerSerial,
     PowerStatus,
     RefreshMode,
+    SpecsMerger,
     TempSensor,
     format_warranty_badge,
+    parse_command_content,
+    parse_frame,
 )
 
 
@@ -301,6 +307,121 @@ class HistoryChartWidget(QtWidgets.QWidget):
         painter.drawText(rect.right() - 150, 15, f"温度 {unit}: {t_vals[-1]:.1f}{unit}")
 
 
+class RemoteCommander:
+    """Fire-and-forget command proxy used when a background daemon owns the PSU.
+
+    It mirrors the subset of :class:`PowerSupplyClient` that the GUI calls, so the
+    window code does not need to know who actually holds the serial port.
+    """
+
+    def __init__(self, worker: "DaemonWorker") -> None:
+        self._worker = worker
+
+    def _send(self, **payload: object) -> bytes:
+        self._worker.send(payload)
+        return b""
+
+    def set_fan_mode(self, mode: FanMode, custom_points: list | None = None) -> bytes:
+        message: dict[str, object] = {"cmd": "set_fan_mode", "mode": int(mode)}
+        if custom_points is not None:
+            message["points"] = [list(p) for p in custom_points]
+        return self._send(**message)
+
+    def set_fan_curve(self, points, switch_to_custom: bool = True) -> bytes:
+        return self._send(cmd="set_curve", points=[list(p) for p in points], switch=switch_to_custom)
+
+    def set_refresh_mode(self, refresh: RefreshMode) -> bytes:
+        return self._send(cmd="set_refresh", index=int(refresh))
+
+    def clear_fault_code(self) -> bytes:
+        return self._send(cmd="clear_fault")
+
+    def close(self) -> None:
+        pass
+
+
+class DaemonWorker(QtCore.QThread):
+    """Talks to the background daemon instead of opening the serial port."""
+
+    info_updated = QtCore.Signal(object, str)
+    status_updated = QtCore.Signal(object)
+    error_occurred = QtCore.Signal(str)
+    state_changed = QtCore.Signal(str)
+
+    def __init__(self, socket_path: Path, parent: QtCore.QObject | None = None) -> None:
+        super().__init__(parent)
+        self.socket_path = Path(socket_path)
+        self._sock: SocketClient | None = None
+        self._running = True
+        self._stop_event = threading.Event()
+        self._merger = SpecsMerger()
+        self._sn = ""
+
+    # -- lifecycle ---------------------------------------------------------
+    def run(self) -> None:
+        try:
+            self._sock = SocketClient(self.socket_path, on_event=self._on_event)
+        except DaemonUnavailable as exc:
+            self.error_occurred.emit(str(exc))
+            self.state_changed.emit("插件：后台守护进程不可用")
+            return
+        except Exception as exc:
+            self.error_occurred.emit(f"连接守护进程失败: {exc}")
+            return
+        self.state_changed.emit("已连接后台采集守护进程")
+        try:
+            self._sock.subscribe()
+        except IpcError as exc:
+            self.error_occurred.emit(str(exc))
+        while self._running:
+            self._stop_event.wait(0.2)
+        if self._sock is not None:
+            self._sock.close()
+            self._sock = None
+
+    def stop(self) -> None:
+        self._running = False
+        self._stop_event.set()
+
+    def send(self, payload: dict[str, object]) -> None:
+        sock = self._sock
+        if sock is None:
+            raise IpcError("尚未连上后台守护进程")
+        sock.send(payload)
+
+    # -- events (reader thread) -------------------------------------------
+    def _on_event(self, message: dict) -> None:
+        kind = message.get("event")
+        if kind == "state":
+            self.state_changed.emit(str(message.get("text", "")))
+            return
+        if kind == "error":
+            self.error_occurred.emit(str(message.get("message", "守护进程错误")))
+            return
+        if kind == "closed":
+            if self._running:
+                self.error_occurred.emit("与后台守护进程的连接已断开")
+            return
+        if kind != "frame":
+            return
+        raw_hex = message.get("raw")
+        if not isinstance(raw_hex, str):
+            return
+        try:
+            raw = parse_frame(bytes.fromhex(raw_hex))
+            parsed = parse_command_content(raw.cmd_id, raw.payload)
+        except Exception:
+            return
+        if isinstance(parsed, PowerStatus):
+            self.status_updated.emit(parsed)
+        elif isinstance(parsed, PowerInfo):
+            merged = self._merger.update(parsed)
+            self.info_updated.emit(merged, self._sn)
+        elif isinstance(parsed, PowerSerial):
+            self._sn = parsed.sn
+            self.info_updated.emit(self._merger.current, self._sn)
+
+
 class TelemetryWorker(QtCore.QThread):
     """Background collector thread keeping the UI responsive.
 
@@ -412,8 +533,16 @@ class MainWindow(QtWidgets.QMainWindow):
             EnergyStore(self._db_path).close()
         except Exception:
             pass
-        self.client = client or PowerSupplyClient(port=port, mock=mock)
-        self._worker: TelemetryWorker | None = None
+        self._socket_path = default_socket_path()
+        self._remote = False
+        # When a daemon is already running there is no point opening the serial port
+        # here: it would fail with TIOCEXCL anyway. Defer client creation in that case.
+        remote_preferred = client is None and not mock and probe_socket(self._socket_path)
+        self.client = client
+        if self.client is None and not remote_preferred:
+            self.client = PowerSupplyClient(port=port, mock=mock)
+        self._commander = self.client
+        self._worker: QtCore.QThread | None = None
         self._cfg = load_config(self._config_path)
         self._fahrenheit = bool(self._cfg.get("fahrenheit", False))
         self._sensor = TempSensor(int(self._cfg.get("sensor", int(TempSensor.LOW_VOLTAGE))))
@@ -702,6 +831,22 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._start_collector:
             self.port_label.setText("状态: 仅查看（未启动采集）")
             return
+        # A background daemon owns the serial port 24/7; when it is running, follow it
+        # over IPC instead of fighting for the port (which would fail with TIOCEXCL).
+        if not self._mock and probe_socket(self._socket_path):
+            worker = DaemonWorker(self._socket_path, self)
+            worker.state_changed.connect(self._on_collector_state)
+            worker.info_updated.connect(self._on_info_updated)
+            worker.status_updated.connect(self._on_status_updated)
+            worker.error_occurred.connect(self._on_worker_error)
+            self._commander = RemoteCommander(worker)
+            self._remote = True
+            self._worker = worker
+            worker.start()
+            return
+        if self.client is None:
+            self.client = PowerSupplyClient(port=self._port, mock=self._mock)
+            self._commander = self.client
         restore_profile = self._build_restore_profile()
         self._worker = TelemetryWorker(
             self.client,
@@ -797,7 +942,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._waiting_clean_exit and self._pending_mode is None and status.mode != FanMode.CLEAN:
             self._waiting_clean_exit = False
             try:
-                self.client.set_fan_mode(status.mode)
+                self._commander.set_fan_mode(status.mode)
             except Exception:
                 pass
 
@@ -835,7 +980,7 @@ class MainWindow(QtWidgets.QMainWindow):
         rate_val = self.refresh_combo.itemData(index)
         try:
             refresh = RefreshMode(int(rate_val))
-            self.client.set_refresh_mode(refresh)
+            self._commander.set_refresh_mode(refresh)
             self._saved_refresh_mode = refresh
             self._persist_config()
         except Exception as exc:
@@ -850,7 +995,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._waiting_clean_exit = True
         try:
             pts = self.curve_widget.points() if mode == FanMode.CUSTOM else None
-            self.client.set_fan_mode(mode, custom_points=pts)
+            self._commander.set_fan_mode(mode, custom_points=pts)
             if mode in PERSISTABLE_FAN_MODES:
                 self._saved_fan_mode = mode
                 self._persist_config()
@@ -872,7 +1017,7 @@ class MainWindow(QtWidgets.QMainWindow):
             pts = self.curve_widget.points()
             self._pending_mode = FanMode.CUSTOM
             self._mode_grace_until = time.monotonic() + 2.5
-            self.client.set_fan_curve(pts, switch_to_custom=True)
+            self._commander.set_fan_curve(pts, switch_to_custom=True)
             self.mode_buttons[FanMode.CUSTOM].setChecked(True)
             self.curve_widget.set_editable(True)
             self._saved_fan_mode = FanMode.CUSTOM
@@ -891,7 +1036,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if reply != QtWidgets.QMessageBox.StandardButton.Yes:
             return
         try:
-            self.client.clear_fault_code()
+            self._commander.clear_fault_code()
             self.statusBar().showMessage("已发送清除故障码指令", 3000)
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "指令发送失败", str(exc))
@@ -900,7 +1045,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._worker is not None:
             self._worker.stop()
             self._worker.wait(2000)
-        self.client.close()
+        if not self._remote and self.client is not None:
+            self.client.close()
         super().closeEvent(event)
 
 
