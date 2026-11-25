@@ -126,6 +126,10 @@ class DaemonTestCase(unittest.TestCase):
             self.assertTrue(
                 wait_for(lambda: any(e.get("event") == "frame" and e.get("cmd") in (3, 5) for e in events))
             )
+            # Both POWER_INFO variants (sub=0 vendor, sub=53 date) must survive the
+            # snapshot cache, otherwise a late-joining GUI cannot merge the specs.
+            info_raw = {e["raw"] for e in events if e.get("event") == "frame" and e.get("cmd") == 3}
+            self.assertGreaterEqual(len(info_raw), 2)
 
             before = len(events)
             client.command(cmd="set_fan_mode", mode=1)

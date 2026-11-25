@@ -25,7 +25,7 @@ from .energy import DEFAULT_DB, EnergyStore
 from .ipc import IpcServer, default_socket_path
 from .protocol import FanMode, PowerInfo, PowerStatus, RawFrame, RefreshMode
 
-MAX_CACHED_FRAMES = 8
+MAX_CACHED_FRAMES = 12
 
 
 class Daemon:
@@ -65,7 +65,9 @@ class Daemon:
         self._failed = False
         self._thread: threading.Thread | None = None
         self._state = "未启动"
-        self._frames: dict[int, dict[str, Any]] = {}
+        # Keyed by raw payload: cmd=0x03 arrives twice (sub=0 vendor/SN, sub=53 build
+        # date) and both are needed for the GUI-side SpecsMerger, so do not key by cmd.
+        self._frames: dict[str, dict[str, Any]] = {}
         self._restored = False
 
     # -- logging -----------------------------------------------------------
@@ -204,10 +206,11 @@ class Daemon:
             "raw": raw.raw_bytes.hex(),
             "crc_ok": bool(raw.crc_valid),
         }
-        self._frames[int(raw.cmd_id)] = payload
-        if len(self._frames) > MAX_CACHED_FRAMES:
-            oldest = next(iter(self._frames))
-            self._frames.pop(oldest, None)
+        key = raw.raw_bytes.hex()
+        self._frames.pop(key, None)
+        self._frames[key] = payload
+        while len(self._frames) > MAX_CACHED_FRAMES:
+            self._frames.pop(next(iter(self._frames)), None)
         self._broadcast(payload)
 
     def _on_specs(self, info: PowerInfo | None, sn: str) -> None:

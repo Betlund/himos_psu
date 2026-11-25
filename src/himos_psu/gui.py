@@ -833,7 +833,9 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         # A background daemon owns the serial port 24/7; when it is running, follow it
         # over IPC instead of fighting for the port (which would fail with TIOCEXCL).
-        if not self._mock and probe_socket(self._socket_path):
+        # Only follow a daemon when no client was injected (tests/embedding pass one)
+        # and this window is not in mock mode.
+        if self.client is None and not self._mock and probe_socket(self._socket_path):
             worker = DaemonWorker(self._socket_path, self)
             worker.state_changed.connect(self._on_collector_state)
             worker.info_updated.connect(self._on_info_updated)
