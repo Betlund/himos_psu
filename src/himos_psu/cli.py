@@ -391,10 +391,14 @@ def _daemon_unit_text(args: argparse.Namespace) -> str:
     home_str = str(Path.home())
     if exec_bin == home_str or exec_bin.startswith(home_str + os.sep):
         exec_bin = "%h" + exec_bin[len(home_str):]
+    # StartLimit* are [Unit] keys since systemd 230; in [Service] they are silently
+    # ignored ("Unknown key" in the journal) and the rate limit stays at the default.
     return (
         "[Unit]\n"
         "Description=HiMOS PSU background collector (serial owner + IPC daemon)\n"
         "After=default.target\n"
+        "StartLimitIntervalSec=300\n"
+        "StartLimitBurst=10\n"
         "\n"
         "[Service]\n"
         "Type=simple\n"
@@ -402,8 +406,6 @@ def _daemon_unit_text(args: argparse.Namespace) -> str:
         f" --stale-timeout {max(0.0, args.stale_timeout):g} --quiet\n"
         "Restart=always\n"
         "RestartSec=5\n"
-        "StartLimitIntervalSec=300\n"
-        "StartLimitBurst=10\n"
         "\n"
         "[Install]\n"
         "WantedBy=default.target\n"
@@ -467,6 +469,25 @@ def _collector_busy() -> bool:
         return False
 
 
+def _user_unit_active(unit: str) -> bool | None:
+    """True when ``unit`` is active, None when systemd cannot be asked."""
+    if shutil.which("systemctl") is None:
+        return None
+    try:
+        proc = subprocess.run(
+            ["systemctl", "--user", "is-active", "--quiet", unit],
+            capture_output=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode == 0:
+        return True
+    if proc.returncode in (1, 3, 4):  # failed / inactive / no such unit
+        return False
+    return None
+
+
 def _install_daemon_unit(unit: str, args: argparse.Namespace) -> int:
     from .ipc import default_socket_path, probe_socket
 
@@ -476,12 +497,20 @@ def _install_daemon_unit(unit: str, args: argparse.Namespace) -> int:
 
     # The serial port is exclusive: enabling the unit while a hand-started daemon
     # (or `collect`, or a GUI collecting) still owns it only produces a crash loop.
+    # Our own running service is the one exception — it only needs a restart.
+    restart_needed = False
     if args.enable:
         daemon_up = probe_socket(socket_path)
         lock_held = not daemon_up and _collector_busy()
         if daemon_up or lock_held:
+            ours = None if args.dry_run else _user_unit_active(DAEMON_UNIT_NAME)
             where = f"{socket_path}" if daemon_up else "默认采集锁"
-            if not args.dry_run:
+            if ours:
+                restart_needed = True
+                print(f"服务已在运行（{where}），安装后会自动重启以应用新单元。")
+            elif args.dry_run:
+                print(f"注意: 已有采集进程在运行（{where}），实际执行时需要先停掉它。")
+            else:
                 print(
                     f"检测到已有采集进程在运行（{where}）。\n"
                     "请先在那个终端按 Ctrl+C 停掉它（手跑的 `himos-psu daemon` 或 GUI 采集），"
@@ -489,7 +518,6 @@ def _install_daemon_unit(unit: str, args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 return 1
-            print(f"注意: 已有采集进程在运行（{where}），实际执行时需要先停掉它。")
 
     if args.dry_run:
         print(f"将写入 {dest}")
@@ -522,6 +550,12 @@ def _install_daemon_unit(unit: str, args: argparse.Namespace) -> int:
         )
         if rc != 0:
             return rc
+        if restart_needed:
+            rc = _run_systemctl(
+                ["systemctl", "--user", "restart", DAEMON_UNIT_NAME], dry_run=args.dry_run
+            )
+            if rc != 0:
+                return rc
     if args.linger:
         user = os.environ.get("USER") or getpass.getuser()
         rc = _run_systemctl(["loginctl", "enable-linger", user], dry_run=args.dry_run)

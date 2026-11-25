@@ -388,6 +388,11 @@ class DaemonUnitInstallTestCase(unittest.TestCase):
         self.assertIn("[Unit]", out)
         self.assertIn("Restart=always", out)
         self.assertIn("ExecStart=/usr/local/bin/himos-psu daemon", out)
+        # StartLimit* moved to [Unit] in systemd 230; in [Service] they are ignored.
+        unit_section, service_section = out.split("[Service]")
+        self.assertIn("StartLimitIntervalSec=300", unit_section)
+        self.assertIn("StartLimitBurst=10", unit_section)
+        self.assertNotIn("StartLimit", service_section)
 
     def test_dry_run_previews_commands_without_writing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -441,6 +446,34 @@ class DaemonUnitInstallTestCase(unittest.TestCase):
                 ],
             )
             self.assertTrue(calls[2][2])
+
+    def test_reinstall_restarts_its_own_running_service(self) -> None:
+        """Re-applying a new unit must not be blocked by the service itself."""
+        calls: list[list[str]] = []
+
+        def fake_run(argv, **_kwargs):
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self._sandbox_env(tmp), mock.patch(
+                "himos_psu.energy.DEFAULT_DB", str(root / "energy.db")
+            ), mock.patch("himos_psu.cli.shutil.which", return_value="/usr/bin/systemctl"), \
+                    mock.patch("himos_psu.cli._user_unit_active", return_value=True), \
+                    mock.patch("himos_psu.cli.subprocess.run", side_effect=fake_run):
+                with collector_lock(root / "collector.lock"):
+                    rc, out, err = self._run(["systemd-daemon", "--install", "--enable"])
+            self.assertEqual(rc, 0, err)
+            self.assertIn("会自动重启", out)
+            self.assertEqual(
+                calls,
+                [
+                    ["systemctl", "--user", "daemon-reload"],
+                    ["systemctl", "--user", "enable", "--now", "himos-psu-collect.service"],
+                    ["systemctl", "--user", "restart", "himos-psu-collect.service"],
+                ],
+            )
 
     def test_install_refuses_while_a_collector_holds_the_lock(self) -> None:
         """`collect` and GUI collection hold the lock but expose no socket."""
