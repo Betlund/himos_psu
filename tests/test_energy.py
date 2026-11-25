@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import csv
+import io
 import os
 import sys
 import tempfile
@@ -13,6 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from himos_psu import cli
 from himos_psu.client import PowerSupplyClient
 from himos_psu.collector import Collector, CollectorBusy
 from himos_psu.energy import (
@@ -79,6 +82,36 @@ class EnergyStoreTestCase(unittest.TestCase):
         self.assertEqual(report.samples, 1)  # one integrated interval (not raw sample count)
         # 2 s of samples inside a 60 s wall window
         self.assertAlmostEqual(report.coverage, 2.0 / 60.0, places=3)
+
+    def test_report_exposes_measured_span(self) -> None:
+        """Coverage is relative to the recorded span, which must be visible."""
+        self.store.set_plan(fixed_plan("测试", 0.5))
+        t0 = BASE + 9 * 3600
+        for offset in (0, 2, 60):  # 09:00:00, 09:00:02, 09:01:00 (58 s gap)
+            self.store.add_sample(t0 + offset, sample(100.0))
+
+        data = self.store.report("t", BASE, BASE + 86400).as_dict()
+        self.assertTrue(data["first_sample_at"].startswith("2026-11-15T09:00"))
+        self.assertTrue(data["last_sample_at"].startswith("2026-11-15T09:01"))
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = cli.main(
+                [
+                    "energy",
+                    "--db",
+                    str(self.store.path),
+                    "report",
+                    "--from",
+                    "2026-11-15",
+                    "--to",
+                    "2026-11-16",
+                ]
+            )
+        self.assertEqual(rc, 0)
+        text = out.getvalue()
+        self.assertIn("记录时段 09:00–09:01", text)
+        self.assertIn("缺口 58 s", text)
 
     def test_gap_is_recorded_not_counted(self) -> None:
         self.store.set_plan(fixed_plan("测试", 0.5))

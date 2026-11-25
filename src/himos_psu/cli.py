@@ -646,7 +646,13 @@ def _print_energy_report(store: EnergyStore, label: str, start_ts: int, end_ts: 
     print(f"  用电量    {format_kwh(report.kwh)} kWh")
     print(f"  电费      {format_yuan(report.cost_cents)}")
     print(f"  平均功率  {report.avg_w:.0f} W        峰值 {report.peak_w:.0f} W")
-    print(f"  覆盖率    {report.coverage * 100:.1f}%（缺口 {report.gap_s:.0f} s）")
+    recorded = ""
+    if report.first_ts and report.last_ts:
+        recorded = (
+            f"{datetime.fromtimestamp(report.first_ts):%H:%M}–"
+            f"{datetime.fromtimestamp(report.last_ts):%H:%M}，"
+        )
+    print(f"  覆盖率    {report.coverage * 100:.1f}%（记录时段 {recorded}缺口 {report.gap_s:.0f} s）")
     if bands:
         parts = []
         for item in bands:

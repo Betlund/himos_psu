@@ -289,6 +289,18 @@ class EnergyReport:
             "avg_w": round(self.avg_w, 1),
             "coverage": round(self.coverage, 4),
             "gap_s": round(self.gap_s, 1),
+            # Coverage is measured between the first and last recorded minute, which
+            # is narrower than the requested range whenever collection started late.
+            "first_sample_at": (
+                datetime.fromtimestamp(self.first_ts).isoformat(timespec="seconds")
+                if self.first_ts
+                else None
+            ),
+            "last_sample_at": (
+                datetime.fromtimestamp(self.last_ts).isoformat(timespec="seconds")
+                if self.last_ts
+                else None
+            ),
             "samples": self.samples,
             "carbon_kg": round(self.carbon_kg, 3),
         }
