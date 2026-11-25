@@ -449,6 +449,24 @@ def _cmd_systemd_daemon(args: argparse.Namespace) -> int:
     return _install_daemon_unit(unit, args)
 
 
+def _collector_busy() -> bool:
+    """True when any process holds the default collector lock."""
+    from .energy import DEFAULT_DB
+
+    lock_path = Path(DEFAULT_DB).parent / "collector.lock"
+    if not lock_path.exists():
+        return False
+    try:
+        with collector_lock(lock_path):
+            return False
+    except CollectorBusy:
+        return True
+    except OSError:
+        # Cannot open the lock file (permissions, read-only mount): let systemctl
+        # report the real failure instead of blocking installation here.
+        return False
+
+
 def _install_daemon_unit(unit: str, args: argparse.Namespace) -> int:
     from .ipc import default_socket_path, probe_socket
 
@@ -457,17 +475,21 @@ def _install_daemon_unit(unit: str, args: argparse.Namespace) -> int:
     socket_path = default_socket_path()
 
     # The serial port is exclusive: enabling the unit while a hand-started daemon
-    # still owns it only produces a crash loop, so refuse up front.
-    if args.enable and probe_socket(socket_path):
-        if not args.dry_run:
-            print(
-                f"检测到后台采集正在运行（{socket_path}）。\n"
-                "请先在运行 `himos-psu daemon` 的终端按 Ctrl+C 停掉它，然后重新执行本命令；"
-                "否则新服务会因为串口被独占而反复启动失败。",
-                file=sys.stderr,
-            )
-            return 1
-        print(f"注意: 后台采集正在运行（{socket_path}），实际执行时需要先停掉它。")
+    # (or `collect`, or a GUI collecting) still owns it only produces a crash loop.
+    if args.enable:
+        daemon_up = probe_socket(socket_path)
+        lock_held = not daemon_up and _collector_busy()
+        if daemon_up or lock_held:
+            where = f"{socket_path}" if daemon_up else "默认采集锁"
+            if not args.dry_run:
+                print(
+                    f"检测到已有采集进程在运行（{where}）。\n"
+                    "请先在那个终端按 Ctrl+C 停掉它（手跑的 `himos-psu daemon` 或 GUI 采集），"
+                    "然后重新执行本命令；否则新服务会因为串口被独占而反复启动失败。",
+                    file=sys.stderr,
+                )
+                return 1
+            print(f"注意: 已有采集进程在运行（{where}），实际执行时需要先停掉它。")
 
     if args.dry_run:
         print(f"将写入 {dest}")

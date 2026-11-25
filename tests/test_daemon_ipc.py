@@ -19,7 +19,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from himos_psu import cli, ipc, protocol
-from himos_psu.collector import Collector, StaleError
+from himos_psu.collector import Collector, StaleError, collector_lock
 from himos_psu.daemon import Daemon
 from himos_psu.energy import EnergyStore
 from himos_psu.ipc import IpcServer, SocketClient, default_socket_path, probe_socket
@@ -366,7 +366,9 @@ class DaemonUnitInstallTestCase(unittest.TestCase):
         # Never touch the real daemon socket: point at a path that cannot exist.
         os.environ[ipc.SOCKET_ENV] = socket or str(Path(tmp) / "no-daemon.sock")
         try:
-            yield
+            # Keep the collector-lock probe away from the real data directory.
+            with mock.patch("himos_psu.energy.DEFAULT_DB", str(Path(tmp) / "energy.db")):
+                yield
         finally:
             for key, value in previous.items():
                 if value is None:
@@ -439,6 +441,21 @@ class DaemonUnitInstallTestCase(unittest.TestCase):
                 ],
             )
             self.assertTrue(calls[2][2])
+
+    def test_install_refuses_while_a_collector_holds_the_lock(self) -> None:
+        """`collect` and GUI collection hold the lock but expose no socket."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dest = root / "systemd" / "user" / "himos-psu-collect.service"
+            with self._sandbox_env(tmp), mock.patch(
+                "himos_psu.energy.DEFAULT_DB", str(root / "energy.db")
+            ):
+                with collector_lock(root / "collector.lock"):
+                    rc, _out, err = self._run(["systemd-daemon", "--install", "--enable"])
+            self.assertEqual(rc, 1)
+            self.assertIn("Ctrl+C", err)
+            self.assertIn("采集锁", err)
+            self.assertFalse(dest.exists())
 
     def test_install_refuses_while_a_manual_daemon_holds_the_port(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
