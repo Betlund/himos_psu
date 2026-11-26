@@ -379,8 +379,9 @@ class ChartHoverTestCase(unittest.TestCase):
                        details=[f"{h:02d}:00 · {100 + h:.0f} W" for h in range(24)])
         plot = chart._plot_rect()
         width = plot.width() / (len(values) - 1)
+        pos = QtCore.QPointF(plot.left() + width * 5, plot.center().y())
         chart.mouseMoveEvent(QtGui.QMouseEvent(
-            QtCore.QEvent.Type.MouseMove, QtCore.QPointF(plot.left() + width * 5, plot.center().y()),
+            QtCore.QEvent.Type.MouseMove, pos, pos,
             QtCore.Qt.MouseButton.NoButton, QtCore.Qt.MouseButton.NoButton,
             QtCore.Qt.KeyboardModifier.NoModifier))
         self.assertEqual(chart._hover, 5)
@@ -408,9 +409,10 @@ class ChartHoverTestCase(unittest.TestCase):
                 tab.range_combo.setCurrentIndex(1)   # 今日（每 5 分钟）
                 tab.refresh()
                 self.assertEqual(tab._range, "fine")
-                expected = max(1, len(tab.chart._values))
-                self.assertGreaterEqual(expected, 270)  # 一天 288 格，今天还没过完
-                self.assertLessEqual(expected, 288)
+                # 槽位数取决于「今天已经过到几点」，UTC 的 CI 上不能用固定值。
+                start, end = tab._today_bounds()
+                expected = len(range(start // 300 * 300, end, 300))
+                self.assertEqual(len(tab.chart._values), expected)
                 self.assertTrue(tab.chart._details)
                 self.assertTrue(any("平均" in d for d in tab.chart._details),
                                 "有数据的格子应带平均值")
