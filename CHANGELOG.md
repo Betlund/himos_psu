@@ -13,6 +13,7 @@
   CLI 新增 `tariff set --heating MM-DD:MM-DD --heating-bands ...` 与 `--preset seasonal`；
   GUI 对话框新增「区分采暖期」勾选、日期输入与「正在编辑」切换。
 - `tariff list` 改为按季节分行列出，长方案不再挤成一行。
+- 固定电价方案切到峰谷分时时，表格不再空白：自动填入四段示例，直接改数字即可。
 - **后台采集守护进程（`himos-psu daemon`）**：独占串口并 24/7 采集，通过 Unix socket 对外提供
   NDJSON IPC——订阅遥测、下发风扇模式/曲线/刷新周期、清故障码。GUI 检测到守护进程时自动切换为
   IPC 跟随模式（不再打开串口），可边采集边调速；`systemd-daemon` 生成带 `Restart=always` 的用户单元。

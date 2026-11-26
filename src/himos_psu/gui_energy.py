@@ -426,6 +426,7 @@ class TariffDialog(QtWidgets.QDialog):
         # Rows are kept per season so switching the editor never loses edits.
         self._rows: dict[str, list[tuple[str, str, str, float]]] = {"normal": [], "heating": []}
         self._editing = "normal"
+        self._seeded = False
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setSpacing(10)
@@ -600,6 +601,12 @@ class TariffDialog(QtWidgets.QDialog):
 
     def _sync_mode(self) -> None:
         tou = self.kind_combo.currentData() == "tou"
+        # Switching a fixed plan to TOU used to leave an empty mandatory table behind;
+        # seed the example shape once so the user edits numbers instead of inventing rows.
+        if tou and not self._rows["normal"] and not self._rows["heating"] and not self._seeded:
+            self._rows["normal"] = [_band_tuple(band) for band in parse_band_spec(CN_TOU_PRESET)]
+            self._seeded = True
+            self._render_table(self._editing)
         seasonal = tou and self.season_check.isChecked()
         self.price_spin.setEnabled(not tou)
         self.table.setEnabled(tou)

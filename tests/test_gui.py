@@ -16,7 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from himos_psu.energy import EnergyStore, fixed_plan, local_day_start
+from himos_psu.energy import EnergyStore, fixed_plan, local_day_start, seasonal_preset
+from himos_psu.gui_energy import TariffDialog
 from himos_psu.fan_curve import DEFAULT_CUSTOM_POINTS
 from himos_psu.gui import MainWindow
 from himos_psu.protocol import FanMode, PowerInfo, PowerStatus
@@ -122,6 +123,51 @@ class GuiSmokeTestCase(unittest.TestCase):
                 self.assertFalse(settings_pixmap.isNull())
             finally:
                 win.close()
+
+
+class TariffDialogTestCase(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    def test_four_decimals_and_empty_table_seeding(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = EnergyStore(Path(tmp) / "energy.db")
+            try:
+                store.set_plan(fixed_plan("家用电", 0.5469))
+                dialog = TariffDialog(store)
+                try:
+                    self.assertEqual(dialog.price_spin.decimals(), 4)
+                    self.assertEqual(dialog.price_spin.text(), "0.5469")
+                    self.assertEqual(dialog.table.rowCount(), 0)  # fixed plan has no bands
+                    dialog.kind_combo.setCurrentIndex(1)          # 切到峰谷分时
+                    self.app.processEvents()
+                    self.assertEqual(dialog.table.rowCount(), 7)
+                    self.assertEqual(dialog.table.item(0, 3).text(), "0.3200")
+                finally:
+                    dialog.close()
+            finally:
+                store.close()
+
+    def test_seasonal_plan_round_trips_through_the_dialog(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = EnergyStore(Path(tmp) / "energy.db")
+            try:
+                store.set_plan(seasonal_preset("采暖"))
+                dialog = TariffDialog(store)
+                try:
+                    self.assertTrue(dialog.season_check.isChecked())
+                    self.assertEqual(dialog.season_start_edit.text(), "11-01")
+                    self.assertEqual(dialog.table.item(0, 3).text(), "0.3769")
+                    dialog.season_combo.setCurrentIndex(1)
+                    self.app.processEvents()
+                    self.assertEqual(dialog.table.rowCount(), 3)
+                    self.assertEqual(dialog.table.item(1, 2).text(), "峰")
+                    self.assertEqual(dialog.table.item(1, 1).text(), "20:00")
+                finally:
+                    dialog.close()
+            finally:
+                store.close()
 
 
 if __name__ == "__main__":
