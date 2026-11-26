@@ -84,6 +84,14 @@ class EnergyStoreTestCase(unittest.TestCase):
         # 2 s of samples inside a 60 s wall window
         self.assertAlmostEqual(report.coverage, 2.0 / 60.0, places=3)
 
+    def test_recorded_days_counts_days_with_data(self) -> None:
+        self.store.set_plan(fixed_plan("测试", 0.5))
+        for offset in (0, 2):  # one interval on day A
+            self.store.add_sample(BASE + 9 * 3600 + offset, sample(100.0))
+        for offset in (0, 2):  # one interval on day B
+            self.store.add_sample(BASE + 86400 + 10 * 3600 + offset, sample(100.0))
+        self.assertEqual(self.store.recorded_days(), 2)
+
     def test_report_exposes_measured_span(self) -> None:
         """Coverage is relative to the recorded span, which must be visible."""
         self.store.set_plan(fixed_plan("测试", 0.5))

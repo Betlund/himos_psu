@@ -913,6 +913,14 @@ class EnergyStore:
         row = self._conn.execute("SELECT MIN(ts) AS ts FROM energy_minute").fetchone()
         return int(row["ts"]) if row and row["ts"] is not None else None
 
+    def recorded_days(self) -> int:
+        """Distinct calendar days that actually contain energy data."""
+        row = self._conn.execute(
+            "SELECT COUNT(DISTINCT date(ts, 'unixepoch', 'localtime')) AS n"
+            " FROM energy_minute WHERE ws > 0"
+        ).fetchone()
+        return int(row["n"]) if row and row["n"] is not None else 0
+
     def last_sample_ts(self) -> int | None:
         row = self._conn.execute("SELECT MAX(ts) AS ts FROM samples").fetchone()
         return int(row["ts"]) if row and row["ts"] is not None else None

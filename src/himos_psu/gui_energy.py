@@ -323,6 +323,11 @@ class SplitDonut(QtWidgets.QWidget):
                    QtCore.Qt.AlignmentFlag.AlignHCenter, self._center_bottom)
 
         lx = rect.right() + 22
+        # Column offsets: the name may be "统一电价" (4 CJK ≈ 48px), so it needs more
+        # room than the old 40px box that used to run into the kWh figure.
+        name_dx, name_w = 16, 56
+        kwh_dx, kwh_w = 78, 78
+        pct_dx, pct_w = 158, 52
         for idx, item in enumerate(self._slices):
             ly = 18 + idx * 26
             if ly > self.height() - 16:
@@ -332,12 +337,13 @@ class SplitDonut(QtWidgets.QWidget):
             p.drawRoundedRect(QtCore.QRectF(lx, ly + 4, 9, 9), 2, 2)
             p.setPen(QtGui.QColor(TEXT))
             p.setFont(QtGui.QFont("", 9))
-            p.drawText(QtCore.QRectF(lx + 16, ly, 40, 18), QtCore.Qt.AlignmentFlag.AlignLeft, str(item["name"]))
+            p.drawText(QtCore.QRectF(lx + name_dx, ly, name_w, 18),
+                       QtCore.Qt.AlignmentFlag.AlignLeft, str(item["name"]))
             p.setPen(QtGui.QColor(MUTED))
             p.setFont(QtGui.QFont("", 9))
-            p.drawText(QtCore.QRectF(lx + 56, ly, 90, 18), QtCore.Qt.AlignmentFlag.AlignLeft,
+            p.drawText(QtCore.QRectF(lx + kwh_dx, ly, kwh_w, 18), QtCore.Qt.AlignmentFlag.AlignLeft,
                        f"{item['kwh']:.2f} kWh")
-            p.drawText(QtCore.QRectF(lx + 140, ly, 52, 18),
+            p.drawText(QtCore.QRectF(lx + pct_dx, ly, pct_w, 18),
                        QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter,
                        f"{item['share'] * 100:.0f}%")
 
@@ -441,10 +447,16 @@ class CalendarHeat(QtWidgets.QWidget):
             is_selected = self._selected == date(self._year, self._month, day)
             if is_today or is_selected:
                 p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
-                pen_color = ACCENT if is_selected else ACCENT2
-                p.setPen(QtGui.QPen(QtGui.QColor(pen_color), 1.8 if is_selected else 1.2))
-                p.drawRoundedRect(QtCore.QRectF(rect.x() + 0.5, rect.y() + 0.5, rect.width() - 1, rect.height() - 1), 3, 3)
-            p.setFont(QtGui.QFont("", 8))
+                if is_selected:
+                    # Selected: thick accent ring + a second inner ring so it reads at a glance.
+                    p.setPen(QtGui.QPen(QtGui.QColor(ACCENT), 2.6))
+                    p.drawRoundedRect(QtCore.QRectF(rect.x() + 1.5, rect.y() + 1.5,
+                                                    rect.width() - 3, rect.height() - 3), 3, 3)
+                else:
+                    p.setPen(QtGui.QPen(QtGui.QColor(ACCENT2), 1.2))
+                    p.drawRoundedRect(QtCore.QRectF(rect.x() + 0.5, rect.y() + 0.5,
+                                                    rect.width() - 1, rect.height() - 1), 3, 3)
+            p.setFont(QtGui.QFont("", 8, QtGui.QFont.Weight.Bold if is_selected else QtGui.QFont.Weight.Normal))
             p.setPen(QtGui.QColor(text_color))
             p.drawText(QtCore.QRectF(rect.x() + 4, rect.y(), rect.width() - 8, rect.height()),
                        QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter, str(day))
@@ -866,7 +878,7 @@ class EnergyTab(QtWidgets.QWidget):
         self.cal_today = QtWidgets.QPushButton("今天")
         self.cal_prev.setToolTip("上一个月")
         self.cal_next.setToolTip("下一个月")
-        self.cal_today.setToolTip("回到本月")
+        self.cal_today.setToolTip("回到本月并取消选中日期")
         for btn in (self.cal_prev, self.cal_next, self.cal_today):
             btn.setObjectName("navBtn")
             btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
@@ -1001,7 +1013,14 @@ class EnergyTab(QtWidgets.QWidget):
         self.kpi_month.set(format_kwh(month.kwh), "kWh",
                            f"已用 {format_yuan(month.cost_cents)} · 预估月账单 ¥{projected:.2f}", ACCENT2)
         since = datetime.fromtimestamp(first).strftime("%Y-%m-%d") if first else "尚未开始"
-        self.kpi_total.set(format_kwh(total.kwh), "kWh", f"自 {since} 起", PURPLE)
+        recorded = store.recorded_days()
+        # "自 X 起" alone reads like continuous coverage; say how many days really have data.
+        self.kpi_total.set(format_kwh(total.kwh), "kWh",
+                           f"自 {since} 起 · 已记录 {recorded} 天", PURPLE)
+        self.kpi_total.setToolTip(
+            f"累计区间从首个有数据的分钟（{since}）到今天；其间实际有数据的是 {recorded} 天，"
+            "没开采集的日子不计入。"
+        )
         peak_ratio = (today.peak_w / self._rated_w * 100.0) if self._rated_w else 0.0
         active = store.active_seconds(start, end)
         self.kpi_runtime.set(format_duration(active), "",
@@ -1099,7 +1118,8 @@ class EnergyTab(QtWidgets.QWidget):
         here = (self._cal_year, self._cal_month)
         self.cal_prev.setEnabled(here > earliest)
         self.cal_next.setEnabled(here < latest)
-        self.cal_today.setEnabled(here != latest)
+        # Always clickable: on the current month it clears a selected day.
+        self.cal_today.setEnabled(True)
 
     def _refresh_load(self) -> None:
         assert self._store is not None

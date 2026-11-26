@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
+import gc
 import os
+import sys
 import sys
 import tempfile
 import time
@@ -17,6 +20,26 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from himos_psu.energy import EnergyStore, fixed_plan, local_day_start, seasonal_preset
+
+
+from himos_psu.energy import EnergyStore, fixed_plan, local_day_start, seasonal_preset
+
+
+# PySide6 finalizes every remaining Qt wrapper while destroying QCoreApplication, and
+# with Python 3.14 that segfaults once a test has painted custom widgets (the process
+# prints OK and then crashes, which would fail CI). Widgets are disposed inside the
+# tests; this just skips the interpreter-side Qt teardown and keeps unittest's status.
+_ORIGINAL_EXIT = sys.exit
+
+
+def _exit_without_qt_teardown(code: object = 0) -> "None":  # noqa: ANN401
+    if isinstance(code, int):
+        os._exit(code)
+    os._exit(0 if not code else 1)
+
+
+if os.environ.get("HIMOS_PSU_QT_TEARDOWN") != "1":
+    sys.exit = _exit_without_qt_teardown  # type: ignore[assignment]
 from himos_psu.gui_energy import TariffDialog
 from himos_psu.fan_curve import DEFAULT_CUSTOM_POINTS
 from himos_psu.gui import MainWindow
@@ -123,6 +146,9 @@ class GuiSmokeTestCase(unittest.TestCase):
                 self.assertFalse(settings_pixmap.isNull())
             finally:
                 win.close()
+                win.deleteLater()
+                QtWidgets.QApplication.processEvents()
+                del win
 
 
 class TariffDialogTestCase(unittest.TestCase):
@@ -146,6 +172,9 @@ class TariffDialogTestCase(unittest.TestCase):
                     self.assertEqual(dialog.table.item(0, 3).text(), "0.3200")
                 finally:
                     dialog.close()
+                    dialog.deleteLater()
+                    QtWidgets.QApplication.processEvents()
+                    del dialog
             finally:
                 store.close()
 
@@ -166,6 +195,9 @@ class TariffDialogTestCase(unittest.TestCase):
                     self.assertEqual(dialog.table.item(1, 1).text(), "20:00")
                 finally:
                     dialog.close()
+                    dialog.deleteLater()
+                    QtWidgets.QApplication.processEvents()
+                    del dialog
             finally:
                 store.close()
 
@@ -234,13 +266,14 @@ class ThemeAndCalendarTestCase(unittest.TestCase):
 
                 tab._goto_current_month()
                 self.assertEqual(tab.cal_month_label.text(), f"{today.year} 年 {today.month} 月")
-                self.assertFalse(tab.cal_today.isEnabled())
+                self.assertTrue(tab.cal_today.isEnabled(), "今天按钮应始终可点")
                 self.assertTrue(tab.cal_prev.isEnabled())
             finally:
                 tab._timer.stop()
                 tab.close()
                 tab.deleteLater()
                 QtWidgets.QApplication.processEvents()
+                del tab
 
 
 class DaySelectionTestCase(unittest.TestCase):
@@ -283,11 +316,17 @@ class DaySelectionTestCase(unittest.TestCase):
                 tab._shift_month(-1)      # 翻月应清掉选中
                 self.assertIsNone(tab._selected_day)
                 self.assertEqual(tab._range, "today")
+
+                tab._on_day_clicked(day)
+                tab._goto_current_month()  # 「今天」也应清掉选中
+                self.assertIsNone(tab._selected_day)
+                self.assertEqual(tab._range, "today")
             finally:
                 tab._timer.stop()
                 tab.close()
                 tab.deleteLater()
                 QtWidgets.QApplication.processEvents()
+                del tab
 
     def test_donut_refreshes_after_a_tariff_edit(self) -> None:
         from himos_psu.energy import fixed_plan, preset_plan
@@ -322,6 +361,7 @@ class DaySelectionTestCase(unittest.TestCase):
                 tab.close()
                 tab.deleteLater()
                 QtWidgets.QApplication.processEvents()
+                del tab
 
 
 if __name__ == "__main__":

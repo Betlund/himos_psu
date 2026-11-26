@@ -1061,11 +1061,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self._worker.wait(2000)
         if not self._remote and self.client is not None:
             self.client.close()
-        # Tabs own refresh timers and sqlite handles; close them before teardown.
+        # Tabs own refresh timers; stop them so nothing fires while the widgets die.
         for attr in ("energy_tab", "settings_tab"):
-            tab = getattr(self, attr, None)
-            if tab is not None:
-                tab.close()
+            timer = getattr(getattr(self, attr, None), "_timer", None)
+            if timer is not None:
+                timer.stop()
         super().closeEvent(event)
 
 
@@ -1078,7 +1078,14 @@ def launch_gui(port: str | None = None, mock: bool = False, db_path: str | Path 
     app.setWindowIcon(QtGui.QIcon(str(Path(__file__).with_name("assets") / "himos-psu.svg")))
     window = MainWindow(port=port, mock=mock, db_path=db_path, start_collector=start_collector)
     window.show()
-    return int(app.exec())
+    code = int(app.exec())
+    # Tear the widget tree down while the QApplication still exists: PySide crashes
+    # during interpreter shutdown if wrappers are finalized after the app is gone.
+    window.close()
+    window.deleteLater()
+    app.processEvents()
+    del window
+    return code
 
 
 def main() -> int:
