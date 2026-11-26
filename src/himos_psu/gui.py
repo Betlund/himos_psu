@@ -32,7 +32,8 @@ from .fan_curve import (
     resample_fan_curve,
     validate_fan_curve,
 )
-from .gui_energy import CARD_QSS, EnergyTab, SettingsTab
+from . import theme
+from .gui_energy import EnergyTab, SettingsTab
 from .ipc import DaemonUnavailable, IpcError, SocketClient, default_socket_path, probe_socket
 from .protocol import (
     FanMode,
@@ -166,11 +167,11 @@ class FanCurveWidget(QtWidgets.QWidget):
         painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
         rect = self._plot_rect()
 
-        painter.fillRect(self.rect(), QtGui.QColor("#11161d"))
-        painter.fillRect(rect, QtGui.QColor("#161d26"))
+        painter.fillRect(self.rect(), QtGui.QColor(theme.P.panel))
+        painter.fillRect(rect, QtGui.QColor(theme.P.panel2))
 
-        grid_pen = QtGui.QPen(QtGui.QColor("#2b3645"), 1, QtCore.Qt.PenStyle.DashLine)
-        text_pen = QtGui.QPen(QtGui.QColor("#9aa8ba"))
+        grid_pen = QtGui.QPen(QtGui.QColor(theme.P.gridline), 1, QtCore.Qt.PenStyle.DashLine)
+        text_pen = QtGui.QPen(QtGui.QColor(theme.P.muted))
         font = painter.font()
         font.setPointSize(8)
         painter.setFont(font)
@@ -201,7 +202,7 @@ class FanCurveWidget(QtWidgets.QWidget):
         # Draw 21 firmware resampled points subtly so users can verify the x9 wire output.
         if self._editable:
             raw = resample_fan_curve(self._points, validate=False)
-            step_color = QtGui.QColor("#38bdf8")
+            step_color = QtGui.QColor(theme.P.accent)
             painter.setPen(QtCore.Qt.PenStyle.NoPen)
             painter.setBrush(step_color)
             for idx, duty in enumerate(raw[:21]):
@@ -209,7 +210,7 @@ class FanCurveWidget(QtWidgets.QWidget):
                 pt_px = self._to_pixel((tx, duty))
                 painter.drawEllipse(pt_px, 2.3, 2.3)
 
-        line_color = QtGui.QColor("#e2f1ff") if self._editable else QtGui.QColor("#525b68")
+        line_color = QtGui.QColor(theme.P.text) if self._editable else QtGui.QColor(theme.P.chart_line_dim)
         line_width = 3.0 if self._editable else 2.0
         painter.setPen(QtGui.QPen(line_color, line_width))
         poly = QtGui.QPolygonF([self._to_pixel(pt) for pt in self._points])
@@ -221,13 +222,13 @@ class FanCurveWidget(QtWidgets.QWidget):
             radius = 6.5 if is_movable else 4.0
             if idx == self._dragging_idx or idx == self._hover_idx:
                 radius = 8.0
-            fill = QtGui.QColor("#38bdf8") if is_movable else line_color
-            painter.setPen(QtGui.QPen(QtGui.QColor("#0d1117"), 1.5))
+            fill = QtGui.QColor(theme.P.accent) if is_movable else line_color
+            painter.setPen(QtGui.QPen(QtGui.QColor(theme.P.bg), 1.5))
             painter.setBrush(fill)
             painter.drawEllipse(px, radius, radius)
 
             if self._editable and idx in (1, 2, 3):
-                painter.setPen(QtGui.QColor("#dce7f5"))
+                painter.setPen(QtGui.QColor(theme.P.text))
                 painter.drawText(
                     QtCore.QRectF(px.x() - 30, px.y() - 24, 60, 16),
                     QtCore.Qt.AlignmentFlag.AlignHCenter,
@@ -269,13 +270,13 @@ class HistoryChartWidget(QtWidgets.QWidget):
         del event
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
-        painter.fillRect(self.rect(), QtGui.QColor("#11161d"))
+        painter.fillRect(self.rect(), QtGui.QColor(theme.P.panel))
 
         rect = self.rect().adjusted(48, 22, -48, -16)
-        painter.fillRect(rect, QtGui.QColor("#161d26"))
+        painter.fillRect(rect, QtGui.QColor(theme.P.panel2))
 
         if len(self._powers) < 2:
-            painter.setPen(QtGui.QColor("#8090a3"))
+            painter.setPen(QtGui.QColor(theme.P.muted))
             painter.drawText(rect, QtCore.Qt.AlignmentFlag.AlignCenter, "等待连续遥测数据...")
             return
 
@@ -297,13 +298,13 @@ class HistoryChartWidget(QtWidgets.QWidget):
             painter.setPen(QtGui.QPen(QtGui.QColor(color), 2.0))
             painter.drawPolyline(QtGui.QPolygonF(pts))
 
-        draw_series(list(self._powers), 0.0, p_max, "#38bdf8")
-        draw_series(t_vals, t_min, t_max, "#fb923c")
+        draw_series(list(self._powers), 0.0, p_max, theme.P.accent)
+        draw_series(t_vals, t_min, t_max, theme.P.band_colors[2])
 
         unit = "°F" if self._fahrenheit else "°C"
-        painter.setPen(QtGui.QColor("#38bdf8"))
+        painter.setPen(QtGui.QColor(theme.P.accent))
         painter.drawText(8, 15, f"功率 W (0~{p_max:.0f}W): {self._powers[-1]:.1f}W")
-        painter.setPen(QtGui.QColor("#fb923c"))
+        painter.setPen(QtGui.QColor(theme.P.band_colors[2]))
         painter.drawText(rect.right() - 150, 15, f"温度 {unit}: {t_vals[-1]:.1f}{unit}")
 
 
@@ -565,28 +566,39 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.setWindowTitle("HiMOS PSU Linux 监控控制面板")
         self.resize(1020, 680)
-        self._apply_dark_style()
+        theme.apply(theme.detect(QtWidgets.QApplication.instance()))
+        self._apply_theme()
+        self._watch_color_scheme()
         self._build_ui()
         self._load_saved_curve()
         self._start_worker()
 
+    def _apply_theme(self) -> None:
+        """Adopt the desktop's colour scheme (called at startup and on change)."""
+        self.setStyleSheet(theme.stylesheet())
+
+    def _watch_color_scheme(self) -> None:
+        """Follow a live light/dark switch; painters read ``theme.P`` each frame."""
+        app = QtWidgets.QApplication.instance()
+        hints = app.styleHints() if app is not None else None
+        signal = getattr(hints, "colorSchemeChanged", None)
+        if signal is None:
+            return
+        try:
+            signal.connect(self._on_color_scheme_changed)
+        except Exception:
+            pass
+
+    @QtCore.Slot()
+    def _on_color_scheme_changed(self, *_args: object) -> None:
+        theme.apply(theme.detect(QtWidgets.QApplication.instance()))
+        self._apply_theme()
+        for widget in self.findChildren(QtWidgets.QWidget):
+            widget.update()
+
     def _apply_dark_style(self) -> None:
-        self.setStyleSheet(
-            """
-            QMainWindow, QWidget { background: #0d1117; color: #e6edf3; font-size: 13px; }
-            QGroupBox { border: 1px solid #253040; border-radius: 8px; margin-top: 10px; padding: 10px; font-weight: bold; }
-            QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; color: #7dd3fc; }
-            QPushButton { background: #1c2430; border: 1px solid #304054; border-radius: 6px; padding: 6px 12px; }
-            QPushButton:hover { background: #263244; }
-            QPushButton:checked { background: #0284c7; border-color: #38bdf8; color: #ffffff; font-weight: bold; }
-            QPushButton#danger { background: #4c1d24; border-color: #991b1b; }
-            QPushButton#danger:hover { background: #7f1d1d; }
-            QComboBox { background: #1c2430; border: 1px solid #304054; border-radius: 5px; padding: 4px 8px; }
-            QLabel#metricValue { font-size: 22px; font-weight: bold; color: #38bdf8; }
-            QLabel#badge { background: #1e293b; border: 1px solid #38bdf8; border-radius: 5px; padding: 2px 8px; color: #7dd3fc; font-weight: bold; }
-            """
-            + CARD_QSS
-        )
+        """Kept as an alias: tests and older call sites used this name."""
+        self._apply_theme()
 
     def _build_ui(self) -> None:
         root = QtWidgets.QWidget()
@@ -1049,6 +1061,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self._worker.wait(2000)
         if not self._remote and self.client is not None:
             self.client.close()
+        # Tabs own refresh timers and sqlite handles; close them before teardown.
+        for attr in ("energy_tab", "settings_tab"):
+            tab = getattr(self, attr, None)
+            if tab is not None:
+                tab.close()
         super().closeEvent(event)
 
 

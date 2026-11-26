@@ -34,36 +34,66 @@ from .energy import (
 )
 from .protocol import FanMode
 
-BG = "#0d1117"
-PANEL = "#11161d"
-PANEL2 = "#161d26"
-BORDER = "#253040"
-TEXT = "#e6edf3"
-MUTED = "#8b9bb0"
-DIM = "#5d6b7e"
-ACCENT = "#38bdf8"
-ACCENT2 = "#7dd3fc"
-ORANGE = "#fb923c"
-GREEN = "#4ade80"
-PURPLE = "#a78bfa"
-RED = "#f87171"
+from . import theme
+from .theme import DARK, Palette
 
-BAND_COLORS = (ACCENT, PURPLE, ORANGE, RED, GREEN, ACCENT2)
+# These aliases are rebound by sync_theme() whenever the palette changes, and the
+# painters below read them at paint time, so a theme swap does not need new widgets.
+BG = DARK.bg
+PANEL = DARK.panel
+PANEL2 = DARK.panel2
+BORDER = DARK.border
+BORDER_STRONG = DARK.border_strong
+TEXT = DARK.text
+MUTED = DARK.muted
+DIM = DARK.dim
+ACCENT = DARK.accent
+ACCENT2 = DARK.accent2
+ACCENT_DARK = DARK.accent_dark
+BUTTON_BG = DARK.button_bg
+BUTTON_HOVER = DARK.button_hover
+GRIDLINE = DARK.gridline
+DANGER_BG = DARK.danger_bg
+BAND_COLORS = DARK.band_colors
+ORANGE = DARK.band_colors[2]
+GREEN = DARK.band_colors[4]
+PURPLE = DARK.band_colors[1]
+RED = DARK.band_colors[3]
+CHART_LINE = DARK.chart_line
+HEAT_LOW = DARK.heat_low
+HEAT_HIGH = DARK.heat_high
+HEAT_STRONG_TEXT = DARK.heat_strong_text
+HEAT_WEAK_TEXT = DARK.heat_weak_text
 
-CARD_QSS = f"""
-QFrame#card {{ background: {PANEL}; border: 1px solid {BORDER}; border-radius: 10px; }}
-QLabel#kpiTitle {{ color: {MUTED}; font-size: 11px; }}
-QLabel#kpiValue {{ color: {ACCENT}; font-size: 24px; font-weight: bold; }}
-QLabel#kpiSub {{ color: {DIM}; font-size: 10px; }}
-QTableWidget {{ background: transparent; border: none; gridline-color: #1e2836; }}
-QHeaderView::section {{ background: {PANEL2}; color: {MUTED}; border: none; padding: 4px 6px; }}
-QTableWidget::item {{ color: {TEXT}; padding: 2px 4px; }}
-QTabWidget::pane {{ border: 1px solid {BORDER}; border-radius: 10px; top: -1px; }}
-QTabBar::tab {{ background: transparent; color: {MUTED}; padding: 7px 18px; margin-right: 4px;
-                border: 1px solid transparent; border-top-left-radius: 8px; border-top-right-radius: 8px; }}
-QTabBar::tab:selected {{ background: {PANEL}; color: {ACCENT}; border-color: {BORDER}; border-bottom-color: {PANEL}; }}
-QTabBar::tab:hover {{ color: {TEXT}; }}
-"""
+
+def sync_theme(palette: Palette) -> None:
+    """Rebind the module-level colour aliases to ``palette``."""
+    global BG, PANEL, PANEL2, BORDER, BORDER_STRONG, TEXT, MUTED, DIM
+    global ACCENT, ACCENT2, ACCENT_DARK, BUTTON_BG, BUTTON_HOVER, GRIDLINE, DANGER_BG
+    global BAND_COLORS, CHART_LINE, HEAT_LOW, HEAT_HIGH, HEAT_STRONG_TEXT, HEAT_WEAK_TEXT
+    global ORANGE, GREEN, PURPLE, RED
+    BG = palette.bg
+    PANEL = palette.panel
+    PANEL2 = palette.panel2
+    BORDER = palette.border
+    BORDER_STRONG = palette.border_strong
+    TEXT = palette.text
+    MUTED = palette.muted
+    DIM = palette.dim
+    ACCENT = palette.accent
+    ACCENT2 = palette.accent2
+    ACCENT_DARK = palette.accent_dark
+    BUTTON_BG = palette.button_bg
+    BUTTON_HOVER = palette.button_hover
+    GRIDLINE = palette.gridline
+    DANGER_BG = palette.danger_bg
+    BAND_COLORS = palette.band_colors
+    ORANGE, PURPLE, RED, GREEN = palette.band_colors[2], palette.band_colors[1], palette.band_colors[3], palette.band_colors[4]
+    CHART_LINE = palette.chart_line
+    HEAT_LOW = palette.heat_low
+    HEAT_HIGH = palette.heat_high
+    HEAT_STRONG_TEXT = palette.heat_strong_text
+    HEAT_WEAK_TEXT = palette.heat_weak_text
 
 
 # --------------------------------------------------------------------------- widgets
@@ -87,7 +117,7 @@ class KpiCard(Card):
         self.value = QtWidgets.QLabel("--")
         self.value.setObjectName("kpiValue")
         self.unit = QtWidgets.QLabel("")
-        self.unit.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        self.unit.setObjectName("cardUnit")
         row.addWidget(self.value, 0, QtCore.Qt.AlignmentFlag.AlignBottom)
         row.addWidget(self.unit, 0, QtCore.Qt.AlignmentFlag.AlignBottom)
         row.addStretch(1)
@@ -351,12 +381,8 @@ class CalendarHeat(QtWidgets.QWidget):
             value = self._values.get(day, 0.0)
             if value > 0:
                 t = (value / vmax) ** 0.85
-                color = QtGui.QColor.fromRgbF(
-                    0.086 + t * 0.14,
-                    0.196 + t * 0.55,
-                    0.290 + t * 0.69,
-                )
-                text_color = BG if t > 0.5 else "#dbeafe"
+                color = QtGui.QColor(*theme.interpolate(HEAT_LOW, HEAT_HIGH, t))
+                text_color = HEAT_STRONG_TEXT if t > 0.5 else HEAT_WEAK_TEXT
             else:
                 color = QtGui.QColor(PANEL2)
                 text_color = DIM
@@ -501,7 +527,7 @@ class TariffDialog(QtWidgets.QDialog):
             "本工具只做价格计算，不联网查询。"
         )
         note.setWordWrap(True)
-        note.setStyleSheet(f"color: {DIM}; font-size: 10px;")
+        note.setObjectName("hint")
         layout.addWidget(note)
 
         buttons = QtWidgets.QDialogButtonBox(
@@ -724,7 +750,7 @@ class EnergyTab(QtWidgets.QWidget):
         chart_layout.setContentsMargins(12, 8, 10, 8)
         head = QtWidgets.QHBoxLayout()
         title = QtWidgets.QLabel("用电曲线")
-        title.setStyleSheet(f"color: {TEXT}; font-weight: bold;")
+        title.setObjectName("cardTitle")
         head.addWidget(title)
         self.range_combo = QtWidgets.QComboBox()
         self.range_combo.addItem("今日（每小时平均功率）", "today")
@@ -742,12 +768,12 @@ class EnergyTab(QtWidgets.QWidget):
         donut_layout = QtWidgets.QVBoxLayout(donut_card)
         donut_layout.setContentsMargins(12, 8, 10, 8)
         donut_title = QtWidgets.QLabel("本月分时段用电")
-        donut_title.setStyleSheet(f"color: {TEXT}; font-weight: bold;")
+        donut_title.setObjectName("cardTitle")
         donut_layout.addWidget(donut_title)
         self.donut = SplitDonut()
         donut_layout.addWidget(self.donut, 1)
         self.band_note = QtWidgets.QLabel("")
-        self.band_note.setStyleSheet(f"color: {DIM}; font-size: 10px;")
+        self.band_note.setObjectName("hint")
         donut_layout.addWidget(self.band_note)
         middle.addWidget(donut_card, 2)
         root.addLayout(middle, 3)
@@ -760,24 +786,35 @@ class EnergyTab(QtWidgets.QWidget):
         cal_layout.setContentsMargins(12, 8, 10, 8)
         cal_head = QtWidgets.QHBoxLayout()
         cal_title = QtWidgets.QLabel("用电日历")
-        cal_title.setStyleSheet(f"color: {TEXT}; font-weight: bold;")
+        cal_title.setObjectName("cardTitle")
         cal_head.addWidget(cal_title)
         cal_head.addStretch(1)
-        self.cal_prev = QtWidgets.QPushButton("‹")
-        self.cal_next = QtWidgets.QPushButton("›")
-        for btn in (self.cal_prev, self.cal_next):
-            btn.setFixedWidth(26)
-            btn.setStyleSheet(f"QPushButton {{ color: {MUTED}; background: transparent; border: 1px solid {BORDER};"
-                              " border-radius: 5px; }")
+        self.cal_month_label = QtWidgets.QLabel("")
+        self.cal_month_label.setObjectName("cardTitle")
+        cal_head.addWidget(self.cal_month_label)
+        cal_head.addSpacing(10)
+        self.cal_prev = QtWidgets.QPushButton("◀")
+        self.cal_next = QtWidgets.QPushButton("▶")
+        self.cal_today = QtWidgets.QPushButton("今天")
+        self.cal_prev.setToolTip("上一个月")
+        self.cal_next.setToolTip("下一个月")
+        self.cal_today.setToolTip("回到本月")
+        for btn in (self.cal_prev, self.cal_next, self.cal_today):
+            btn.setObjectName("navBtn")
+            btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.cal_prev.setFixedWidth(34)
+        self.cal_next.setFixedWidth(34)
         self.cal_prev.clicked.connect(lambda: self._shift_month(-1))
         self.cal_next.clicked.connect(lambda: self._shift_month(1))
+        self.cal_today.clicked.connect(self._goto_current_month)
         cal_head.addWidget(self.cal_prev)
         cal_head.addWidget(self.cal_next)
+        cal_head.addWidget(self.cal_today)
         cal_layout.addLayout(cal_head)
         self.calendar = CalendarHeat()
         cal_layout.addWidget(self.calendar, 1)
         self.cal_note = QtWidgets.QLabel("")
-        self.cal_note.setStyleSheet(f"color: {DIM}; font-size: 10px;")
+        self.cal_note.setObjectName("hint")
         cal_layout.addWidget(self.cal_note)
         bottom.addWidget(cal_card, 3)
 
@@ -785,7 +822,7 @@ class EnergyTab(QtWidgets.QWidget):
         load_layout = QtWidgets.QVBoxLayout(load_card)
         load_layout.setContentsMargins(12, 8, 10, 8)
         load_title = QtWidgets.QLabel("负载率分布（本月）")
-        load_title.setStyleSheet(f"color: {TEXT}; font-weight: bold;")
+        load_title.setObjectName("cardTitle")
         load_layout.addWidget(load_title)
         self.load_bars = LoadBars()
         load_layout.addWidget(self.load_bars, 1)
@@ -795,7 +832,7 @@ class EnergyTab(QtWidgets.QWidget):
         sess_layout = QtWidgets.QVBoxLayout(sess_card)
         sess_layout.setContentsMargins(12, 8, 10, 8)
         sess_title = QtWidgets.QLabel("最近供电会话")
-        sess_title.setStyleSheet(f"color: {TEXT}; font-weight: bold;")
+        sess_title.setObjectName("cardTitle")
         sess_layout.addWidget(sess_title)
         self.sessions = QtWidgets.QTableWidget(0, 4)
         self.sessions.setHorizontalHeaderLabels(["时间", "时长", "用电", "费用"])
@@ -812,7 +849,7 @@ class EnergyTab(QtWidgets.QWidget):
 
         footer = QtWidgets.QHBoxLayout()
         self.status_label = QtWidgets.QLabel("")
-        self.status_label.setStyleSheet(f"color: {DIM}; font-size: 10px;")
+        self.status_label.setObjectName("hint")
         footer.addWidget(self.status_label, 1)
         self.export_btn = QtWidgets.QToolButton()
         self.export_btn.setText("导出 CSV")
@@ -835,6 +872,14 @@ class EnergyTab(QtWidgets.QWidget):
             self._store = EnergyStore(self.db_path, create=False)
         except Exception:
             self._store = None
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802 (Qt naming)
+        """Stop the refresh timer and release sqlite before the widget dies."""
+        self._timer.stop()
+        if self._store is not None:
+            self._store.close()
+            self._store = None
+        super().closeEvent(event)
 
     def set_info(self, info: Any) -> None:
         rated = getattr(info, "rated_power", 0) if info is not None else 0
@@ -935,13 +980,35 @@ class EnergyTab(QtWidgets.QWidget):
         elif plan:
             self.band_note.setText(f"当前电价：统一 {plan.price:.{PRICE_DECIMALS}f} 元/kWh")
 
+    def _calendar_bounds(self) -> tuple[tuple[int, int], tuple[int, int]]:
+        """Navigable range: a year back (or the first recorded month) .. this month."""
+        today = date.today()
+        current = (today.year, today.month)
+        year, month = current
+        for _ in range(12):  # always allow looking a year back, even before data
+            month -= 1
+            if month == 0:
+                year, month = year - 1, 12
+        floor = (year, month)
+        first_ts = self._store.first_ts() if self._store is not None else None
+        if not first_ts:
+            return floor, current
+        first_day = datetime.fromtimestamp(first_ts).date()
+        return min((first_day.year, first_day.month), floor), current
+
     def _refresh_calendar(self) -> None:
         assert self._store is not None
         values = self._store.calendar(self._cal_year, self._cal_month)
         self.calendar.set_month(self._cal_year, self._cal_month, values)
+        self.cal_month_label.setText(f"{self._cal_year} 年 {self._cal_month} 月")
         month_total = sum(values.values())
         self.cal_note.setText(f"{self._cal_year}-{self._cal_month:02d} 已记录 {len(values)} 天 · "
                               f"合计 {format_kwh(month_total)} kWh")
+        earliest, latest = self._calendar_bounds()
+        here = (self._cal_year, self._cal_month)
+        self.cal_prev.setEnabled(here > earliest)
+        self.cal_next.setEnabled(here < latest)
+        self.cal_today.setEnabled(here != latest)
 
     def _refresh_load(self) -> None:
         assert self._store is not None
@@ -989,7 +1056,13 @@ class EnergyTab(QtWidgets.QWidget):
             year, month = year - 1, 12
         elif month > 12:
             year, month = year + 1, 1
-        self._cal_year, self._cal_month = year, month
+        earliest, latest = self._calendar_bounds()
+        self._cal_year, self._cal_month = min(max((year, month), earliest), latest)
+        self._refresh_calendar()
+
+    def _goto_current_month(self) -> None:
+        today = date.today()
+        self._cal_year, self._cal_month = today.year, today.month
         self._refresh_calendar()
 
     def _export(self, kind: str) -> None:
@@ -1046,7 +1119,7 @@ class SettingsTab(QtWidgets.QWidget):
         restore_layout.addWidget(self.auto_restore_check)
         self.restore_summary_label = QtWidgets.QLabel("--")
         self.restore_summary_label.setWordWrap(True)
-        self.restore_summary_label.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        self.restore_summary_label.setObjectName("cardUnit")
         restore_layout.addWidget(self.restore_summary_label)
         root.addWidget(restore_box)
 
@@ -1105,11 +1178,11 @@ class SettingsTab(QtWidgets.QWidget):
             "采样由 PSU 自身的推送间隔决定（1–3 s），断档按缺口记录、不按 0 W 补算。"
         )
         note.setWordWrap(True)
-        note.setStyleSheet(f"color: {DIM}; font-size: 10px;")
+        note.setObjectName("hint")
         root.addWidget(note)
 
         self.state_label = QtWidgets.QLabel("")
-        self.state_label.setStyleSheet(f"color: {MUTED}; font-size: 10px;")
+        self.state_label.setObjectName("hint")
         root.addWidget(self.state_label)
         root.addStretch(1)
 

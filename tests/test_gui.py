@@ -170,5 +170,78 @@ class TariffDialogTestCase(unittest.TestCase):
                 store.close()
 
 
+class ThemeAndCalendarTestCase(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    def tearDown(self) -> None:
+        from himos_psu import theme
+
+        os.environ.pop("HIMOS_PSU_THEME", None)
+        theme.apply(theme.DARK)
+
+    def test_env_override_switches_every_painter_alias(self) -> None:
+        from himos_psu import gui_energy, theme
+
+        os.environ["HIMOS_PSU_THEME"] = "dark"
+        self.assertEqual(theme.detect().name, "dark")
+        theme.apply(theme.detect())
+        self.assertEqual(gui_energy.BG, theme.DARK.bg)
+        self.assertEqual(gui_energy.BAND_COLORS, theme.DARK.band_colors)
+
+        os.environ["HIMOS_PSU_THEME"] = "light"
+        theme.apply(theme.detect())
+        self.assertEqual(gui_energy.BG, theme.LIGHT.bg)
+        self.assertEqual(gui_energy.BORDER, theme.LIGHT.border)
+
+        sheet = theme.stylesheet()
+        self.assertIn(theme.LIGHT.bg, sheet)
+        self.assertIn(theme.LIGHT.accent, sheet)
+        self.assertIn("QPushButton#navBtn", sheet)
+
+    def test_calendar_header_shows_month_and_navigates(self) -> None:
+        from himos_psu.gui_energy import EnergyTab
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "energy.db"
+            store = EnergyStore(db)
+            now = int(time.time())
+            for offset in range(0, 300, 5):
+                store.add_sample(now - offset, status(180.0))
+            # Two older samples 40 days back so that month owns a real minute bucket
+            # (a lone sample never integrates, so it would not appear in the calendar).
+            store.add_sample(now - 40 * 86400, status(180.0))
+            store.add_sample(now - 40 * 86400 + 2, status(180.0))
+            store.close()
+
+            tab = EnergyTab(db)
+            try:
+                tab.refresh()
+                today = date.today()
+                self.assertEqual(tab.cal_month_label.text(), f"{today.year} 年 {today.month} 月")
+                self.assertFalse(tab.cal_next.isEnabled(), "不该翻到未来月份")
+
+                tab._shift_month(-1)
+                prev_year, prev_month = (today.year, today.month - 1) if today.month > 1 else (today.year - 1, 12)
+                self.assertEqual(tab.cal_month_label.text(), f"{prev_year} 年 {prev_month} 月")
+                self.assertTrue(tab.cal_next.isEnabled())
+                # 没有数据的月份也要能翻到，否则按钮看起来像坏的
+                for _ in range(3):
+                    tab._shift_month(-1)
+                self.assertIn("年", tab.cal_month_label.text())
+                self.assertTrue(tab.cal_prev.isEnabled())
+
+                tab._goto_current_month()
+                self.assertEqual(tab.cal_month_label.text(), f"{today.year} 年 {today.month} 月")
+                self.assertFalse(tab.cal_today.isEnabled())
+                self.assertTrue(tab.cal_prev.isEnabled())
+            finally:
+                tab._timer.stop()
+                tab.close()
+                tab.deleteLater()
+                QtWidgets.QApplication.processEvents()
+
+
 if __name__ == "__main__":
     unittest.main()
