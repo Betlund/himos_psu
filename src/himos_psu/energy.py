@@ -810,6 +810,52 @@ class EnergyStore:
             values.append(sums[hour] / covered[hour])
         return values
 
+    def power_series(self, start_ts: int, end_ts: int, step_s: int = 3600,
+                     min_coverage_s: float = 30.0) -> list[dict[str, Any]]:
+        """Average/min/max watts per fixed step (hour, 5 minutes, ...).
+
+        Raw data is 1 s samples kept for 14 days plus permanent 1-minute buckets,
+        so a step smaller than a minute would be inventing resolution. ``avg`` is
+        None for slots with too little coverage instead of a fake 0 W.
+        """
+        if step_s <= 0:
+            raise ValueError("step_s 必须大于 0")
+        start = int(start_ts) // step_s * step_s
+        buckets: dict[int, list[float]] = {}
+        for row in self._conn.execute(
+            "SELECT ts, ws, cov_s FROM energy_minute WHERE ts >= ? AND ts < ?",
+            (start, int(end_ts)),
+        ):
+            covered = float(row["cov_s"])
+            if covered <= 0:
+                continue
+            watts = float(row["ws"]) / covered
+            key = int(row["ts"]) // step_s * step_s
+            bucket = buckets.get(key)
+            if bucket is None:
+                buckets[key] = [float(row["ws"]), covered, watts, watts]
+            else:
+                bucket[0] += float(row["ws"])
+                bucket[1] += covered
+                bucket[2] = min(bucket[2], watts)
+                bucket[3] = max(bucket[3], watts)
+
+        series: list[dict[str, Any]] = []
+        stamp = start
+        while stamp < int(end_ts):
+            bucket = buckets.get(stamp)
+            if bucket is None or bucket[1] < min_coverage_s:
+                series.append({"ts": stamp, "avg": None, "min": None, "max": None})
+            else:
+                series.append({
+                    "ts": stamp,
+                    "avg": bucket[0] / bucket[1],
+                    "min": bucket[2],
+                    "max": bucket[3],
+                })
+            stamp += step_s
+        return series
+
     def daily_series(self, start_day: date, end_day: date) -> list[dict[str, Any]]:
         rows = self._conn.execute(
             "SELECT date(ts, 'unixepoch', 'localtime') AS d, SUM(ws) AS ws, SUM(cost_cents) AS cents"

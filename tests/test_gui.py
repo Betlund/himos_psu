@@ -364,5 +364,63 @@ class DaySelectionTestCase(unittest.TestCase):
                 del tab
 
 
+class ChartHoverTestCase(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    def test_hover_maps_x_to_the_nearest_point(self) -> None:
+        from himos_psu.gui_energy import PowerChart
+
+        chart = PowerChart()
+        chart.resize(600, 220)
+        values = [100.0 + i for i in range(24)]
+        chart.set_data(values, [f"{h:02d}" for h in range(24)], "W",
+                       details=[f"{h:02d}:00 · {100 + h:.0f} W" for h in range(24)])
+        plot = chart._plot_rect()
+        width = plot.width() / (len(values) - 1)
+        chart.mouseMoveEvent(QtGui.QMouseEvent(
+            QtCore.QEvent.Type.MouseMove, QtCore.QPointF(plot.left() + width * 5, plot.center().y()),
+            QtCore.Qt.MouseButton.NoButton, QtCore.Qt.MouseButton.NoButton,
+            QtCore.Qt.KeyboardModifier.NoModifier))
+        self.assertEqual(chart._hover, 5)
+        self.assertIn("105 W", chart._details[5])
+        chart.leaveEvent(QtCore.QEvent(QtCore.QEvent.Type.Leave))
+        self.assertIsNone(chart._hover)
+        chart.deleteLater()
+        QtWidgets.QApplication.processEvents()
+
+    def test_fine_range_uses_five_minute_buckets(self) -> None:
+        from himos_psu.energy import fixed_plan
+        from himos_psu.gui_energy import EnergyTab
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "energy.db"
+            store = EnergyStore(db)
+            store.set_plan(fixed_plan("测试", 0.5))
+            now = int(time.time())
+            for offset in range(1200, 0, -2):  # 2 s apart: wider gaps are not integrated
+                store.add_sample(now - offset, status(180.0))
+            store.close()
+
+            tab = EnergyTab(db)
+            try:
+                tab.range_combo.setCurrentIndex(1)   # 今日（每 5 分钟）
+                tab.refresh()
+                self.assertEqual(tab._range, "fine")
+                expected = max(1, len(tab.chart._values))
+                self.assertGreaterEqual(expected, 270)  # 一天 288 格，今天还没过完
+                self.assertLessEqual(expected, 288)
+                self.assertTrue(tab.chart._details)
+                self.assertTrue(any("平均" in d for d in tab.chart._details),
+                                "有数据的格子应带平均值")
+            finally:
+                tab._timer.stop()
+                tab.close()
+                tab.deleteLater()
+                QtWidgets.QApplication.processEvents()
+                del tab
+
+
 if __name__ == "__main__":
     unittest.main()

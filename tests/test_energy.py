@@ -310,6 +310,28 @@ class EnergyStoreTestCase(unittest.TestCase):
         self.assertEqual(len(series), 2)
         self.assertAlmostEqual(series[1]["kwh"], 12000 / 3_600_000, places=6)
 
+    def test_power_series_aggregates_minutes(self) -> None:
+        self.store.set_plan(fixed_plan("测试", 0.5))
+        start = BASE + 10 * 3600
+        for minute in range(3):  # three minutes at 100 W (2 s apart: a 30 s gap is skipped)
+            base = start + minute * 60
+            self.store.add_sample(base, sample(100.0))
+            self.store.add_sample(base + 2, sample(100.0))
+        series = self.store.power_series(start, start + 3600, 3600, min_coverage_s=1.0)
+        self.assertEqual(len(series), 1)
+        self.assertAlmostEqual(series[0]["avg"], 100.0, places=3)
+        self.assertAlmostEqual(series[0]["min"], 100.0, places=3)
+        self.assertAlmostEqual(series[0]["max"], 100.0, places=3)
+
+        fine = self.store.power_series(start, start + 600, 300, min_coverage_s=1.0)
+        self.assertEqual(len(fine), 2)
+        self.assertIsNotNone(fine[0]["avg"])
+        self.assertIsNone(fine[1]["avg"], "没采集的 5 分钟应留空而不是 0 W")
+        # 覆盖不足时按默认阈值留空，避免把几秒样本当成整小时均值
+        self.assertIsNone(self.store.power_series(start, start + 3600, 3600)[0]["avg"])
+        with self.assertRaises(ValueError):
+            self.store.power_series(start, start + 600, 0)
+
     def test_hourly_profile(self) -> None:
         self.store.set_plan(fixed_plan("测试", 0.5))
         for i in range(61):

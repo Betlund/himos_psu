@@ -139,20 +139,56 @@ class PowerChart(QtWidgets.QWidget):
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         self.setMinimumHeight(190)
+        self.setMouseTracking(True)
         self._values: list[float | None] = []
         self._labels: list[str] = []
+        self._details: list[str] = []
         self._unit = "W"
         self._caption = ""
         self._peak_prefix = "峰值"
+        self._hover: int | None = None
 
     def set_data(self, values: Sequence[float | None], labels: Sequence[str], unit: str = "W",
-                 caption: str = "", peak_prefix: str = "峰值") -> None:
+                 caption: str = "", peak_prefix: str = "峰值",
+                 details: Sequence[str] | None = None) -> None:
         self._values = list(values)
         self._labels = list(labels)
+        self._details = list(details) if details is not None else []
         self._unit = unit
         self._caption = caption
         self._peak_prefix = peak_prefix
+        self._hover = None
         self.update()
+
+    # -- hover -------------------------------------------------------------
+    def _plot_rect(self) -> QtCore.QRectF:
+        pad_l, pad_r, pad_t, pad_b = 48, 14, 26, 26
+        return QtCore.QRectF(pad_l, pad_t, max(60.0, self.width() - pad_l - pad_r),
+                             max(50.0, self.height() - pad_t - pad_b))
+
+    def _index_at(self, pos: QtCore.QPointF) -> int | None:
+        if not self._values:
+            return None
+        plot = self._plot_rect()
+        count = len(self._values)
+        width = plot.width() / max(1, count - 1) if count > 1 else plot.width()
+        if width <= 0:
+            return None
+        idx = round((pos.x() - plot.left()) / width)
+        return max(0, min(count - 1, int(idx)))
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt naming)
+        idx = self._index_at(event.position())
+        if idx != self._hover:
+            self._hover = idx
+            self.update()
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event: QtCore.QEvent) -> None:  # noqa: N802 (Qt naming)
+        if self._hover is not None:
+            self._hover = None
+            self.update()
+        super().leaveEvent(event)
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
         del event
@@ -172,10 +208,11 @@ class PowerChart(QtWidgets.QWidget):
         vmax = max(values)
         if self._unit == "W":
             step = 50.0 if vmax <= 500 else (100.0 if vmax <= 2000 else 500.0)
-            top = max(step, math.ceil(vmax * 1.15 / step) * step)
         else:
             step = 0.5 if vmax <= 5 else (1.0 if vmax <= 20 else 5.0)
-            top = max(step, math.ceil(vmax * 1.15 / step) * step)
+        # Three grid bands, so keep the top a multiple of 3*step and the labels round
+        # (350 used to show as 117 / 233 / 350).
+        top = max(3 * step, math.ceil(vmax * 1.15 / (3 * step)) * (3 * step))
 
         for i in range(4):
             gy = plot.bottom() - (i / 3.0) * plot.height()
@@ -251,20 +288,68 @@ class PowerChart(QtWidgets.QWidget):
                 p.drawText(QtCore.QRectF(tx, ty, 130, 16), QtCore.Qt.AlignmentFlag.AlignLeft, label)
 
         if self._labels:
-            step_idx = max(1, len(self._labels) // 7)
-            for idx in range(0, len(self._labels), step_idx):
+            slots = [i for i, lbl in enumerate(self._labels) if lbl]
+            step_idx = max(1, len(slots) // 7)
+            for pos, idx in enumerate(slots):
+                if pos % step_idx:
+                    continue
                 x = plot.left() + idx * width
                 p.setFont(QtGui.QFont("", 7))
                 p.setPen(QtGui.QColor(DIM))
-                p.drawText(QtCore.QRectF(x - 20, plot.bottom() + 4, 40, 14),
+                p.drawText(QtCore.QRectF(x - 22, plot.bottom() + 4, 44, 14),
                            QtCore.Qt.AlignmentFlag.AlignHCenter | QtCore.Qt.AlignmentFlag.AlignTop,
                            self._labels[idx])
+
+        self._paint_hover(p, plot, points, width)
 
         if self._caption:
             p.setFont(QtGui.QFont("", 8))
             p.setPen(QtGui.QColor(DIM))
             p.drawText(QtCore.QRectF(pad_l, 4, self.width() - pad_l - pad_r, 16),
                        QtCore.Qt.AlignmentFlag.AlignLeft, self._caption)
+
+    def _paint_hover(self, p: QtGui.QPainter, plot: QtCore.QRectF,
+                     points: list[QtCore.QPointF | None], width: float) -> None:
+        """Crosshair + value box under the cursor, like a trading chart."""
+        idx = self._hover
+        if idx is None or not (0 <= idx < len(self._values)):
+            return
+        x = plot.left() + idx * width
+        pt = points[idx] if idx < len(points) else None
+        p.setPen(QtGui.QPen(QtGui.QColor(ACCENT2), 1, QtCore.Qt.PenStyle.DashLine))
+        p.drawLine(QtCore.QPointF(x, plot.top()), QtCore.QPointF(x, plot.bottom()))
+        if pt is not None:
+            p.setPen(QtGui.QPen(QtGui.QColor(BG), 2))
+            p.setBrush(QtGui.QColor(ACCENT2))
+            p.drawEllipse(pt, 4.0, 4.0)
+            p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+
+        detail = self._details[idx] if idx < len(self._details) else ""
+        if not detail:
+            label = self._labels[idx] if idx < len(self._labels) else ""
+            value = self._values[idx]
+            if value is None:
+                detail = f"{label} · 无数据".strip(" ·")
+            else:
+                detail = f"{label} · {value:.0f} {self._unit}" if self._unit == "W" else f"{label} · {value:.2f} {self._unit}"
+
+        # Rough text width (CJK glyphs are wider) keeps the box from being clipped
+        # without asking Qt for font metrics on every mouse move.
+        text_w = sum(11.0 if ord(ch) > 0x2E80 else 7.0 for ch in detail)
+        box_w = min(max(120.0, text_w + 18), plot.width() - 8)
+        box_h = 22.0
+        box_x = min(max(plot.left() + 4, x + 12), plot.right() - box_w - 4)
+        if box_x < x + 12:  # flipped to the left side: keep it off the cursor
+            box_x = max(plot.left() + 4, x - box_w - 12)
+        box_y = plot.top() + 6
+        box = QtCore.QRectF(box_x, box_y, box_w, box_h)
+        p.setPen(QtGui.QPen(QtGui.QColor(BORDER_STRONG), 1))
+        p.setBrush(QtGui.QColor(PANEL2))
+        p.drawRoundedRect(box, 4, 4)
+        p.setPen(QtGui.QColor(TEXT))
+        p.setFont(QtGui.QFont("", 8))
+        p.drawText(box.adjusted(9, 0, -6, 0),
+                   QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter, detail)
 
 
 class SplitDonut(QtWidgets.QWidget):
@@ -833,6 +918,7 @@ class EnergyTab(QtWidgets.QWidget):
         head.addWidget(title)
         self.range_combo = QtWidgets.QComboBox()
         self.range_combo.addItem("今日（每小时平均功率）", "today")
+        self.range_combo.addItem("今日（每 5 分钟）", "fine")
         self.range_combo.addItem("近 7 天（每日电量）", "week")
         self.range_combo.addItem("近 30 天（每日电量）", "month")
         self.range_combo.addItem("选中日（点击日历）", "day")
@@ -1031,22 +1117,49 @@ class EnergyTab(QtWidgets.QWidget):
         assert self._store is not None
         store = self._store
         today = date.today()
-        if self._range == "day":
-            day = self._selected_day or today
-            self.chart.set_data(store.hourly_watts(day), [f"{h:02d}" for h in range(24)], "W",
-                                f"{day:%Y-%m-%d} 每小时平均功率，缺口留空",
-                                peak_prefix="小时均值峰值")
-        elif self._range == "today":
-            values = store.hourly_watts(today)
-            self.chart.set_data(values, [f"{h:02d}" for h in range(24)], "W",
-                                "每小时平均功率，缺口留空", peak_prefix="小时均值峰值")
+        if self._range in ("today", "fine", "day"):
+            if self._range == "day":
+                day = self._selected_day or today
+                step, start = 3600, local_day_start(day)
+                end = min(local_day_end(day), int(time.time()))
+                caption = f"{day:%Y-%m-%d} 每小时平均功率，缺口留空"
+                peak_prefix = "小时均值峰值"
+            else:
+                step = 300 if self._range == "fine" else 3600
+                start, end = self._today_bounds()
+                caption = ("5 分钟平均功率，缺口留空" if self._range == "fine"
+                           else "每小时平均功率，缺口留空")
+                peak_prefix = "5 分钟峰值" if self._range == "fine" else "小时均值峰值"
+            series = store.power_series(start, end, step)
+            values: list[float | None] = []
+            labels: list[str] = []
+            details: list[str] = []
+            for item in series:
+                when = datetime.fromtimestamp(item["ts"])
+                values.append(item["avg"])
+                if self._range == "fine":
+                    # Only every third hour gets a label; the rest stay blank so the
+                    # axis does not turn into a grey band.
+                    labels.append(f"{when:%H:%M}" if when.minute == 0 and when.hour % 3 == 0 else "")
+                else:
+                    labels.append(f"{when:%H}")
+                if item["avg"] is None:
+                    details.append(f"{when:%H:%M} · 无数据")
+                else:
+                    details.append(
+                        f"{when:%H:%M} · 平均 {item['avg']:.0f} W"
+                        f" · 最高 {item['max']:.0f} W · 最低 {item['min']:.0f} W"
+                    )
+            self.chart.set_data(values, labels, "W", caption,
+                                peak_prefix=peak_prefix, details=details)
         else:
             days = 6 if self._range == "week" else 29
             series = store.daily_series(today - timedelta(days=days), today)
             values = [item["kwh"] for item in series]
             labels = [item["date"].strftime("%m-%d") for item in series]
+            details = [f"{item['date']:%Y-%m-%d} · {item['kwh']:.3f} kWh" for item in series]
             self.chart.set_data(values, labels, "kWh", "每日电量，未采集的日期为 0",
-                                peak_prefix="单日峰值")
+                                peak_prefix="单日峰值", details=details)
 
     def _refresh_donut(self) -> None:
         assert self._store is not None
