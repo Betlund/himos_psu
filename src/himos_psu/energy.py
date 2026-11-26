@@ -586,6 +586,15 @@ class EnergyStore:
             self._plan = self.active_plan() or preset_plan()
         return self._plan
 
+    def invalidate_plan(self) -> None:
+        """Drop the cached tariff so the next call re-reads the active row.
+
+        The GUI edits tariffs through a second connection, so without this the
+        tab kept billing with the previous plan (a fixed plan still showed 峰/谷).
+        """
+        self._plan = None
+        self._plan_minute = None
+
     def _refresh_plan_if_new_minute(self, ts: float) -> None:
         bucket = minute_ts(ts)
         if self._plan_minute == bucket:
@@ -746,7 +755,9 @@ class EnergyStore:
         return report
 
     def band_breakdown(self, start_ts: int, end_ts: int) -> list[dict[str, Any]]:
-        plan = self._current_plan()
+        # Read the active plan every time: a cached one survives a tariff edit made
+        # in another connection and would keep splitting by stale 峰/谷 bands.
+        plan = self.active_plan() or self._current_plan()
         buckets: dict[str, dict[str, float]] = {}
         for row in self._conn.execute(
             "SELECT ts, ws FROM energy_minute WHERE ts >= ? AND ts < ? AND ws > 0", (int(start_ts), int(end_ts))

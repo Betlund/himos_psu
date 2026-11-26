@@ -198,6 +198,26 @@ class EnergyStoreTestCase(unittest.TestCase):
         self.assertIn("0.3469", lines[1])
         self.assertEqual(fixed_plan("x", 0.5469).describe_lines(), ["统一 0.5469 元/kWh"])
 
+    def test_band_breakdown_follows_a_plan_change_from_another_connection(self) -> None:
+        """The donut kept showing 峰/谷 after the GUI saved a fixed plan."""
+        self.store.set_plan(preset_plan())
+        start = int(datetime(2026, 12, 15, 21, 0).timestamp())
+        for offset in (0, 2, 4):
+            self.store.add_sample(start + offset, sample(100.0))
+        tou = self.store.band_breakdown(start - 60, start + 120)
+        self.assertEqual([item["name"] for item in tou], ["峰"])  # 21:00 属于 21-23 峰段
+        self.assertAlmostEqual(tou[0]["price"], 0.92, places=6)
+
+        other = EnergyStore(self.store.path)
+        try:
+            other.set_plan(fixed_plan("固定电价", 0.555))
+        finally:
+            other.close()
+
+        fixed = self.store.band_breakdown(start - 60, start + 120)
+        self.assertEqual([item["name"] for item in fixed], ["统一电价"])
+        self.assertAlmostEqual(fixed[0]["price"], 0.555, places=6)
+
     def test_prices_keep_four_decimals(self) -> None:
         self.assertIn("0.5550", fixed_plan("x", 0.555).describe())
         plan = seasonal_preset()

@@ -343,29 +343,80 @@ class SplitDonut(QtWidgets.QWidget):
 
 
 class CalendarHeat(QtWidgets.QWidget):
-    """Month calendar with per-day energy intensity."""
+    """Month calendar with per-day energy intensity; clickable days."""
+
+    dayClicked = QtCore.Signal(object)  # datetime.date
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         self.setMinimumHeight(180)
+        self.setMouseTracking(True)
+        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
         self._year = date.today().year
         self._month = date.today().month
         self._values: dict[int, float] = {}
+        self._selected: date | None = None
 
     def set_month(self, year: int, month: int, values: dict[int, float]) -> None:
         self._year, self._month, self._values = year, month, values
         self.update()
+
+    def set_selected(self, day: date | None) -> None:
+        self._selected = day
+        self.update()
+
+    # -- geometry ----------------------------------------------------------
+    def _grid(self) -> tuple[int, int, float, float]:
+        days = calendar.monthrange(self._year, self._month)[1]
+        offset = date(self._year, self._month, 1).weekday()  # Monday == 0
+        rows = (offset + days + 6) // 7
+        cell_w = (self.width() - 6 * 4) / 7.0
+        cell_h = (self.height() - 18 - (rows - 1) * 4) / rows
+        return offset, days, cell_w, cell_h
+
+    def _cell_rect(self, day: int) -> tuple[QtCore.QRectF, int, int]:
+        offset, _days, cell_w, cell_h = self._grid()
+        row, col = divmod(offset + day - 1, 7)
+        x = col * (cell_w + 4)
+        y = 18 + row * (cell_h + 4)
+        return QtCore.QRectF(x, y, cell_w, cell_h), row, col
+
+    def day_at(self, pos: QtCore.QPoint) -> int | None:
+        """Which day number is under ``pos`` (None for gaps/headers)."""
+        _offset, days, _cw, _ch = self._grid()
+        for day in range(1, days + 1):
+            if self._cell_rect(day)[0].contains(QtCore.QPointF(pos)):
+                return day
+        return None
+
+    # -- events ------------------------------------------------------------
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt naming)
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            day = self.day_at(event.position().toPoint())
+            if day is not None:
+                self.dayClicked.emit(date(self._year, self._month, day))
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt naming)
+        day = self.day_at(event.position().toPoint())
+        if day is None:
+            QtWidgets.QToolTip.hideText()
+        else:
+            when = date(self._year, self._month, day)
+            value = self._values.get(day)
+            detail = f"{value:.3f} kWh" if value else "暂无记录"
+            QtWidgets.QToolTip.showText(
+                event.globalPosition().toPoint(), f"{when:%Y-%m-%d} · {detail}\n点击查看当日曲线", self
+            )
+        super().mouseMoveEvent(event)
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
         del event
         p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
         p.fillRect(self.rect(), QtGui.QColor(BG))
-        days = calendar.monthrange(self._year, self._month)[1]
-        offset = date(self._year, self._month, 1).weekday()  # Monday == 0
-        rows = (offset + days + 6) // 7
-        cell_w = (self.width() - 6 * 4) / 7.0
-        cell_h = (self.height() - 18 - (rows - 1) * 4) / rows
+        offset, days, cell_w, cell_h = self._grid()
         p.setFont(QtGui.QFont("", 7))
         for col, name in enumerate("一二三四五六日"):
             p.setPen(QtGui.QColor(DIM))
@@ -374,10 +425,7 @@ class CalendarHeat(QtWidgets.QWidget):
         vmax = max(self._values.values()) if self._values else 1.0
         today = date.today()
         for day in range(1, days + 1):
-            index = offset + day - 1
-            row, col = divmod(index, 7)
-            x = col * (cell_w + 4)
-            y = 18 + row * (cell_h + 4)
+            rect, _row, _col = self._cell_rect(day)
             value = self._values.get(day, 0.0)
             if value > 0:
                 t = (value / vmax) ** 0.85
@@ -388,14 +436,17 @@ class CalendarHeat(QtWidgets.QWidget):
                 text_color = DIM
             p.setBrush(color)
             p.setPen(QtCore.Qt.PenStyle.NoPen)
-            p.drawRoundedRect(QtCore.QRectF(x, y, cell_w, cell_h), 3, 3)
-            if (self._year, self._month, day) == (today.year, today.month, today.day):
+            p.drawRoundedRect(rect, 3, 3)
+            is_today = (self._year, self._month, day) == (today.year, today.month, today.day)
+            is_selected = self._selected == date(self._year, self._month, day)
+            if is_today or is_selected:
                 p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
-                p.setPen(QtGui.QPen(QtGui.QColor(ACCENT2), 1.2))
-                p.drawRoundedRect(QtCore.QRectF(x + 0.5, y + 0.5, cell_w - 1, cell_h - 1), 3, 3)
+                pen_color = ACCENT if is_selected else ACCENT2
+                p.setPen(QtGui.QPen(QtGui.QColor(pen_color), 1.8 if is_selected else 1.2))
+                p.drawRoundedRect(QtCore.QRectF(rect.x() + 0.5, rect.y() + 0.5, rect.width() - 1, rect.height() - 1), 3, 3)
             p.setFont(QtGui.QFont("", 8))
             p.setPen(QtGui.QColor(text_color))
-            p.drawText(QtCore.QRectF(x + 4, y, cell_w - 8, cell_h),
+            p.drawText(QtCore.QRectF(rect.x() + 4, rect.y(), rect.width() - 8, rect.height()),
                        QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter, str(day))
 
 
@@ -472,6 +523,11 @@ class TariffDialog(QtWidgets.QDialog):
         form.addRow("固定单价", self.price_spin)
         layout.addLayout(form)
 
+        self.tou_box = QtWidgets.QWidget()
+        tou_layout = QtWidgets.QVBoxLayout(self.tou_box)
+        tou_layout.setContentsMargins(0, 0, 0, 0)
+        tou_layout.setSpacing(8)
+
         season_row = QtWidgets.QHBoxLayout()
         self.season_check = QtWidgets.QCheckBox("区分采暖期（时段与电价不同）")
         self.season_start_edit = QtWidgets.QLineEdit("11-01")
@@ -486,7 +542,7 @@ class TariffDialog(QtWidgets.QDialog):
         season_row.addWidget(QtWidgets.QLabel("至（次年）"))
         season_row.addWidget(self.season_end_edit)
         season_row.addStretch(1)
-        layout.addLayout(season_row)
+        tou_layout.addLayout(season_row)
 
         editor_row = QtWidgets.QHBoxLayout()
         editor_row.addWidget(QtWidgets.QLabel("正在编辑"))
@@ -495,15 +551,15 @@ class TariffDialog(QtWidgets.QDialog):
         self.season_combo.addItem("采暖期", "heating")
         editor_row.addWidget(self.season_combo)
         editor_row.addStretch(1)
-        layout.addLayout(editor_row)
+        tou_layout.addLayout(editor_row)
 
         self.table = QtWidgets.QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(["开始", "结束", "时段名", "单价"])
         self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
         self.table.verticalHeader().setVisible(False)
         self.hint = QtWidgets.QLabel("峰谷时段（必须从 00:00 连续覆盖到 24:00）")
-        layout.addWidget(self.hint)
-        layout.addWidget(self.table, 1)
+        tou_layout.addWidget(self.hint)
+        tou_layout.addWidget(self.table, 1)
 
         row = QtWidgets.QHBoxLayout()
         self.add_btn = QtWidgets.QPushButton("添加时段")
@@ -516,11 +572,18 @@ class TariffDialog(QtWidgets.QDialog):
         row.addWidget(self.del_btn)
         row.addWidget(self.preset_btn)
         row.addStretch(1)
-        layout.addLayout(row)
+        tou_layout.addLayout(row)
+        layout.addWidget(self.tou_box, 1)
 
         self.recalc_check = QtWidgets.QCheckBox("保存后按新电价重算历史费用")
         self.recalc_check.setChecked(True)
         layout.addWidget(self.recalc_check)
+
+        self.fixed_hint = QtWidgets.QLabel(
+            "固定电价：所有用电按上面这一个单价计算，不需要时段表。"
+        )
+        self.fixed_hint.setObjectName("hint")
+        layout.addWidget(self.fixed_hint)
 
         note = QtWidgets.QLabel(
             "电价保留 4 位小数（如 0.5469）。价格为示例默认值，请按当地居民峰谷/阶梯电价填写；"
@@ -633,22 +696,24 @@ class TariffDialog(QtWidgets.QDialog):
             self._rows["normal"] = [_band_tuple(band) for band in parse_band_spec(CN_TOU_PRESET)]
             self._seeded = True
             self._render_table(self._editing)
-        seasonal = tou and self.season_check.isChecked()
+        # A fixed plan has no bands at all: hide the whole editor instead of showing
+        # a disabled, empty table that looks broken.
+        self.tou_box.setVisible(tou)
+        self.fixed_hint.setVisible(not tou)
         self.price_spin.setEnabled(not tou)
-        self.table.setEnabled(tou)
-        for widget in (self.add_btn, self.del_btn, self.preset_btn):
-            widget.setEnabled(tou)
+        seasonal = tou and self.season_check.isChecked()
         for widget in (self.season_check,):
             widget.setEnabled(tou)
         for widget in (self.season_start_edit, self.season_end_edit, self.season_combo):
             widget.setEnabled(seasonal)
-        if not tou:
-            self.hint.setText("固定电价无需时段")
-        else:
+        if tou:
             self.hint.setText(
                 ("采暖期" if self._editing == "heating" else "非采暖期")
                 + "峰谷时段（必须从 00:00 连续覆盖到 24:00）"
             )
+            self.resize(620, 640)
+        else:
+            self.resize(620, 300)
 
     def _collect_bands(self, key: str) -> tuple[Band, ...]:
         source = self._capture_table() if key == self._editing else self._rows[key]
@@ -720,6 +785,8 @@ class EnergyTab(QtWidgets.QWidget):
         self._cal_year = date.today().year
         self._cal_month = date.today().month
         self._range = "today"
+        self._selected_day: date | None = None
+        self._month_values: dict[int, float] = {}
         self._build()
         self._open()
         self._timer = QtCore.QTimer(self)
@@ -756,6 +823,7 @@ class EnergyTab(QtWidgets.QWidget):
         self.range_combo.addItem("今日（每小时平均功率）", "today")
         self.range_combo.addItem("近 7 天（每日电量）", "week")
         self.range_combo.addItem("近 30 天（每日电量）", "month")
+        self.range_combo.addItem("选中日（点击日历）", "day")
         self.range_combo.currentIndexChanged.connect(self._on_range_changed)
         head.addWidget(self.range_combo)
         head.addStretch(1)
@@ -812,6 +880,7 @@ class EnergyTab(QtWidgets.QWidget):
         cal_head.addWidget(self.cal_today)
         cal_layout.addLayout(cal_head)
         self.calendar = CalendarHeat()
+        self.calendar.dayClicked.connect(self._on_day_clicked)
         cal_layout.addWidget(self.calendar, 1)
         self.cal_note = QtWidgets.QLabel("")
         self.cal_note.setObjectName("hint")
@@ -943,7 +1012,12 @@ class EnergyTab(QtWidgets.QWidget):
         assert self._store is not None
         store = self._store
         today = date.today()
-        if self._range == "today":
+        if self._range == "day":
+            day = self._selected_day or today
+            self.chart.set_data(store.hourly_watts(day), [f"{h:02d}" for h in range(24)], "W",
+                                f"{day:%Y-%m-%d} 每小时平均功率，缺口留空",
+                                peak_prefix="小时均值峰值")
+        elif self._range == "today":
             values = store.hourly_watts(today)
             self.chart.set_data(values, [f"{h:02d}" for h in range(24)], "W",
                                 "每小时平均功率，缺口留空", peak_prefix="小时均值峰值")
@@ -1001,9 +1075,26 @@ class EnergyTab(QtWidgets.QWidget):
         values = self._store.calendar(self._cal_year, self._cal_month)
         self.calendar.set_month(self._cal_year, self._cal_month, values)
         self.cal_month_label.setText(f"{self._cal_year} 年 {self._cal_month} 月")
-        month_total = sum(values.values())
-        self.cal_note.setText(f"{self._cal_year}-{self._cal_month:02d} 已记录 {len(values)} 天 · "
-                              f"合计 {format_kwh(month_total)} kWh")
+        self._month_values = values
+        self._refresh_calendar_note()
+
+    def _refresh_calendar_note(self) -> None:
+        """Month summary, or the clicked day's numbers."""
+        assert self._store is not None
+        day = self._selected_day
+        if day is not None and (day.year, day.month) == (self._cal_year, self._cal_month):
+            start = local_day_start(day)
+            end = min(local_day_end(day), int(time.time()))
+            report = self._store.report("day", start, end)
+            peak = f" · 峰值 {report.peak_w:.0f} W" if report.peak_w else ""
+            self.cal_note.setText(
+                f"{day:%Y-%m-%d} · {format_kwh(report.kwh)} kWh · {format_yuan(report.cost_cents)}{peak}"
+                " · 再点一次取消"
+            )
+            return
+        month_total = sum(self._month_values.values())
+        self.cal_note.setText(f"{self._cal_year}-{self._cal_month:02d} 已记录 {len(self._month_values)} 天 · "
+                              f"合计 {format_kwh(month_total)} kWh · 点某一天看当日曲线")
         earliest, latest = self._calendar_bounds()
         here = (self._cal_year, self._cal_month)
         self.cal_prev.setEnabled(here > earliest)
@@ -1047,9 +1138,37 @@ class EnergyTab(QtWidgets.QWidget):
     # -- actions -----------------------------------------------------------
     def _on_range_changed(self, _index: int) -> None:
         self._range = self.range_combo.currentData()
+        if self._range != "day" and self._selected_day is not None:
+            self._selected_day = None
+            self.calendar.set_selected(None)
+            self._refresh_calendar_note()
         self._refresh_chart()
 
+    def _select_range(self, key: str) -> None:
+        """Switch the chart range without re-entering _on_range_changed."""
+        index = self.range_combo.findData(key)
+        self._range = key
+        if index >= 0 and index != self.range_combo.currentIndex():
+            self.range_combo.blockSignals(True)
+            self.range_combo.setCurrentIndex(index)
+            self.range_combo.blockSignals(False)
+        self._refresh_chart()
+
+    @QtCore.Slot(object)
+    def _on_day_clicked(self, day: date) -> None:
+        """Clicking a calendar day shows that day's hourly curve; again cancels."""
+        if self._selected_day == day:
+            self._selected_day = None
+            self.calendar.set_selected(None)
+            self._select_range("today")
+        else:
+            self._selected_day = day
+            self.calendar.set_selected(day)
+            self._select_range("day")
+        self._refresh_calendar_note()
+
     def _shift_month(self, delta: int) -> None:
+        self._clear_day_selection()
         month = self._cal_month + delta
         year = self._cal_year
         if month < 1:
@@ -1061,9 +1180,16 @@ class EnergyTab(QtWidgets.QWidget):
         self._refresh_calendar()
 
     def _goto_current_month(self) -> None:
+        self._clear_day_selection()
         today = date.today()
         self._cal_year, self._cal_month = today.year, today.month
         self._refresh_calendar()
+
+    def _clear_day_selection(self) -> None:
+        if self._selected_day is not None:
+            self._selected_day = None
+            self.calendar.set_selected(None)
+            self._select_range("today")
 
     def _export(self, kind: str) -> None:
         default = f"himos-energy-{kind}-{date.today():%Y%m%d}.csv"
@@ -1088,6 +1214,8 @@ class EnergyTab(QtWidgets.QWidget):
         try:
             dialog = TariffDialog(store, self)
             if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+                if self._store is not None:
+                    self._store.invalidate_plan()
                 self.refresh()
         finally:
             store.close()

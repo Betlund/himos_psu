@@ -152,6 +152,9 @@ def apply(palette: Palette | None = None) -> Palette:
 
 def stylesheet() -> str:
     """Main-window stylesheet for the active palette."""
+    from pathlib import Path
+
+    arrows = Path(__file__).with_name("assets").as_posix()
     return f"""
         QMainWindow, QWidget {{ background: {P.bg}; color: {P.text}; font-size: 13px; }}
         QGroupBox {{ border: 1px solid {P.border}; border-radius: 8px; margin-top: 10px;
@@ -172,6 +175,22 @@ def stylesheet() -> str:
         QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox {{
             background: {P.button_bg}; border: 1px solid {P.border_strong};
             border-radius: 5px; padding: 4px 8px; color: {P.text}; }}
+        QSpinBox, QDoubleSpinBox {{ padding: 4px 24px 4px 10px; }}
+        QSpinBox::up-button, QDoubleSpinBox::up-button {{
+            subcontrol-origin: border; subcontrol-position: top right; width: 20px;
+            border-left: 1px solid {P.border_strong}; border-top-right-radius: 4px;
+            background: {P.panel2}; }}
+        QSpinBox::down-button, QDoubleSpinBox::down-button {{
+            subcontrol-origin: border; subcontrol-position: bottom right; width: 20px;
+            border-left: 1px solid {P.border_strong}; border-bottom-right-radius: 4px;
+            background: {P.panel2}; }}
+        QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
+        QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {{
+            background: {P.button_hover}; }}
+        QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {{
+            image: url("{arrows}/arrow-up.svg"); width: 8px; height: 5px; }}
+        QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{
+            image: url("{arrows}/arrow-down.svg"); width: 8px; height: 5px; }}
         QLabel#metricValue {{ font-size: 22px; font-weight: bold; color: {P.accent}; }}
         QLabel#badge {{ background: {P.badge_bg}; border: 1px solid {P.accent};
                         border-radius: 5px; padding: 2px 8px; color: {P.accent2};

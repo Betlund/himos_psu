@@ -243,5 +243,86 @@ class ThemeAndCalendarTestCase(unittest.TestCase):
                 QtWidgets.QApplication.processEvents()
 
 
+class DaySelectionTestCase(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    def test_clicking_a_day_switches_the_chart_and_back(self) -> None:
+        from himos_psu.energy import preset_plan
+        from himos_psu.gui_energy import EnergyTab
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "energy.db"
+            store = EnergyStore(db)
+            store.set_plan(preset_plan())
+            now = int(time.time())
+            for offset in range(600, 0, -3):  # oldest first: integration needs order
+                store.add_sample(now - offset, status(200.0))
+            store.close()
+
+            tab = EnergyTab(db)
+            try:
+                tab.refresh()
+                day = date.today()
+                self.assertIsNone(tab._selected_day)
+                tab._on_day_clicked(day)
+                self.assertEqual(tab._selected_day, day)
+                self.assertEqual(tab._range, "day")
+                self.assertEqual(tab.range_combo.currentData(), "day")
+                self.assertIn(day.strftime("%Y-%m-%d"), tab.chart._caption)
+                self.assertIn(day.strftime("%Y-%m-%d"), tab.cal_note.text())
+                self.assertIn("再点一次取消", tab.cal_note.text())
+
+                tab._on_day_clicked(day)  # 再点一次取消
+                self.assertIsNone(tab._selected_day)
+                self.assertEqual(tab._range, "today")
+                self.assertNotIn("再点一次取消", tab.cal_note.text())
+
+                tab._on_day_clicked(day)
+                tab._shift_month(-1)      # 翻月应清掉选中
+                self.assertIsNone(tab._selected_day)
+                self.assertEqual(tab._range, "today")
+            finally:
+                tab._timer.stop()
+                tab.close()
+                tab.deleteLater()
+                QtWidgets.QApplication.processEvents()
+
+    def test_donut_refreshes_after_a_tariff_edit(self) -> None:
+        from himos_psu.energy import fixed_plan, preset_plan
+        from himos_psu.gui_energy import EnergyTab
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "energy.db"
+            store = EnergyStore(db)
+            store.set_plan(preset_plan())
+            now = int(time.time())
+            for offset in range(600, 0, -3):
+                store.add_sample(now - offset, status(200.0))
+            store.close()
+
+            tab = EnergyTab(db)
+            try:
+                tab.refresh()
+                self.assertTrue(tab.donut._slices)
+                self.assertNotIn("统一电价", [s["name"] for s in tab.donut._slices])
+
+                other = EnergyStore(db)
+                try:
+                    other.set_plan(fixed_plan("固定电价", 0.555))
+                    other.recalc_costs()
+                finally:
+                    other.close()
+                tab._store.invalidate_plan()
+                tab.refresh()
+                self.assertEqual([s["name"] for s in tab.donut._slices], ["统一电价"])
+            finally:
+                tab._timer.stop()
+                tab.close()
+                tab.deleteLater()
+                QtWidgets.QApplication.processEvents()
+
+
 if __name__ == "__main__":
     unittest.main()
