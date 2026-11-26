@@ -10,7 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -21,11 +21,14 @@ from himos_psu.collector import Collector, CollectorBusy
 from himos_psu.energy import (
     Band,
     EnergyStore,
+    SeasonWindow,
+    TariffPlan,
     fixed_plan,
     format_duration,
     local_day_start,
     parse_band_spec,
     preset_plan,
+    seasonal_preset,
     validate_bands,
 )
 from himos_psu.protocol import FanMode, PowerStatus
@@ -139,6 +142,100 @@ class EnergyStoreTestCase(unittest.TestCase):
         self.assertLess(active, 61.0)
 
     # -- pricing ----------------------------------------------------------
+    def test_season_window_switches_bands_and_prices(self) -> None:
+        plan = seasonal_preset()
+        # 非采暖期：峰 08:00-22:00；采暖期：峰 08:00-20:00，21:00 已经回落
+        summer_peak = int(datetime(2026, 7, 15, 21, 0).timestamp())
+        winter_valley = int(datetime(2026, 12, 15, 21, 0).timestamp())
+        self.assertAlmostEqual(plan.price_at(summer_peak), 0.5769, places=6)
+        self.assertAlmostEqual(plan.price_at(winter_valley), 0.3469, places=6)
+        self.assertEqual(plan.band_name_at(summer_peak), "峰")
+        self.assertEqual(plan.band_name_at(winter_valley), "谷")
+
+    def test_season_window_wraps_the_new_year(self) -> None:
+        plan = seasonal_preset()
+        window = plan.season
+        self.assertIsNotNone(window)
+        assert window is not None
+        self.assertTrue(window.covers(datetime(2026, 11, 1, 0, 0)))
+        self.assertTrue(window.covers(datetime(2027, 1, 15, 12, 0)))
+        self.assertTrue(window.covers(datetime(2027, 3, 31, 23, 59)))
+        self.assertFalse(window.covers(datetime(2027, 4, 1, 0, 0)))
+        self.assertFalse(window.covers(datetime(2026, 10, 31, 23, 59)))
+        self.assertFalse(window.covers(datetime(2026, 7, 1, 12, 0)))
+
+    def test_seasonal_plan_round_trips_through_the_store(self) -> None:
+        stored = self.store.set_plan(seasonal_preset("采暖方案"))
+        self.assertIsNotNone(stored.season)
+        active = self.store.active_plan()
+        self.assertIsNotNone(active)
+        assert active is not None
+        self.assertEqual(active.name, "采暖方案")
+        self.assertIsNotNone(active.season)
+        assert active.season is not None
+        self.assertEqual(active.season.label, "采暖期")
+        self.assertEqual(active.season.range_label, "11-01..03-31")
+        self.assertEqual([b.name for b in active.season.bands], ["谷", "峰", "谷"])
+        self.assertAlmostEqual(active.season.bands[0].price, 0.3469, places=6)
+        self.assertAlmostEqual(active.bands[0].price, 0.3769, places=6)
+
+    def test_costs_follow_the_heating_season(self) -> None:
+        self.store.set_plan(seasonal_preset())
+        start = int(datetime(2026, 12, 15, 21, 0).timestamp())  # 采暖期 谷段
+        for offset in (0, 2, 4):
+            self.store.add_sample(start + offset, sample(100.0))
+        report = self.store.report("t", start - 60, start + 120)
+        kwh = (100.0 * 2 + 100.0 * 2) / 3_600_000
+        self.assertAlmostEqual(report.kwh, kwh, places=9)
+        self.assertAlmostEqual(report.cost_cents, kwh * 100 * 0.3469, places=4)
+
+    def test_describe_lines_split_the_two_seasons(self) -> None:
+        lines = seasonal_preset().describe_lines()
+        self.assertEqual(len(lines), 2)
+        self.assertIn("非采暖期", lines[0])
+        self.assertIn("0.3769", lines[0])
+        self.assertIn("采暖期 11-01..03-31", lines[1])
+        self.assertIn("0.3469", lines[1])
+        self.assertEqual(fixed_plan("x", 0.5469).describe_lines(), ["统一 0.5469 元/kWh"])
+
+    def test_prices_keep_four_decimals(self) -> None:
+        self.assertIn("0.5550", fixed_plan("x", 0.555).describe())
+        plan = seasonal_preset()
+        self.assertIn("0.5769", plan.describe())
+        self.assertIn("0.3469", plan.describe())
+
+    def test_season_needs_a_full_day_of_bands(self) -> None:
+        with self.assertRaises(ValueError):
+            self.store.set_plan(
+                TariffPlan(
+                    name="坏方案",
+                    kind="tou",
+                    bands=parse_band_spec("0-24:谷:0.3"),
+                    season=SeasonWindow(
+                        label="采暖期",
+                        start=(11, 1),
+                        end=(3, 31),
+                        bands=parse_band_spec("0-8:谷:0.3"),
+                    ),
+                )
+            )
+
+    def test_fixed_plan_rejects_a_season(self) -> None:
+        with self.assertRaises(ValueError):
+            self.store.set_plan(
+                TariffPlan(
+                    name="固定",
+                    kind="fixed",
+                    price=0.555,
+                    season=SeasonWindow(
+                        label="采暖期",
+                        start=(11, 1),
+                        end=(3, 31),
+                        bands=parse_band_spec("0-24:谷:0.3"),
+                    ),
+                )
+            )
+
     def test_tou_price_boundaries(self) -> None:
         plan = preset_plan()
         self.assertEqual(plan.price_at(BASE + 6 * 3600 + 59 * 60), 0.32)   # 谷

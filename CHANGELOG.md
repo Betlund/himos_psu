@@ -6,6 +6,13 @@
 
 ### 新增
 
+- 电价保留 **4 位小数**（`0.5469` 这类居民一档价不再被截成 `0.547`）：GUI 的固定单价输入框与时段表、
+  `tariff list` 输出、方案描述统一按 4 位显示，存储本来就不丢精度。
+- 电价方案支持**采暖期/非采暖期两套时段**：`TariffPlan.season`（跨年窗口，如 `11-01..03-31`），
+  窗口内按 `--heating-bands` 计价、其余日期按 `--bands`，`price_at()`/`recalc_costs()` 自动分季。
+  CLI 新增 `tariff set --heating MM-DD:MM-DD --heating-bands ...` 与 `--preset seasonal`；
+  GUI 对话框新增「区分采暖期」勾选、日期输入与「正在编辑」切换。
+- `tariff list` 改为按季节分行列出，长方案不再挤成一行。
 - **后台采集守护进程（`himos-psu daemon`）**：独占串口并 24/7 采集，通过 Unix socket 对外提供
   NDJSON IPC——订阅遥测、下发风扇模式/曲线/刷新周期、清故障码。GUI 检测到守护进程时自动切换为
   IPC 跟随模式（不再打开串口），可边采集边调速；`systemd-daemon` 生成带 `Restart=always` 的用户单元。

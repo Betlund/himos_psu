@@ -17,6 +17,7 @@ Design notes
 
 from __future__ import annotations
 
+import calendar
 import csv
 import json
 import os
@@ -43,6 +44,9 @@ CN_TOU_PRESET = (
     "0-7:谷:0.32,7-10:平:0.58,10-15:峰:0.92,"
     "15-18:平:0.58,18-21:尖:1.15,21-23:峰:0.92,23-24:谷:0.32"
 )
+# 北方冬季（采暖期）峰段缩短到 20:00、谷价更低；这里给的是示例值。
+CN_TOU_PRESET_NORMAL = "0-8:谷:0.3769,8-22:峰:0.5769,22-24:谷:0.3769"
+CN_TOU_PRESET_HEATING = "0-8:谷:0.3469,8-20:峰:0.5769,20-24:谷:0.3469"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -124,6 +128,28 @@ def _minutes_to_hm(value: int) -> str:
 
 
 # --------------------------------------------------------------------------- tariff
+PRICE_DECIMALS = 4  # 元/kWh; 山东居民一档 0.5469 这种四位小数必须原样保留
+
+
+def _parse_monthday(text: str) -> tuple[int, int]:
+    """Parse ``11-01`` / ``11.1`` / ``3/31`` into ``(month, day)``."""
+    raw = text.strip().replace(".", "-").replace("/", "-")
+    parts = raw.split("-")
+    if len(parts) != 2:
+        raise ValueError(f"日期格式应为 MM-DD，收到 {text!r}")
+    month, day = int(parts[0]), int(parts[1])
+    if not 1 <= month <= 12:
+        raise ValueError(f"月份超出范围: {text!r}")
+    max_day = calendar.monthrange(2024, month)[1]  # 2024 是闰年，允许 02-29
+    if not 1 <= day <= max_day:
+        raise ValueError(f"{month} 月没有 {day} 日")
+    return month, day
+
+
+def _format_monthday(value: tuple[int, int]) -> str:
+    return f"{value[0]:02d}-{value[1]:02d}"
+
+
 @dataclass(frozen=True, slots=True)
 class Band:
     """One price band of a time-of-use plan, covering [start_min, end_min)."""
@@ -143,8 +169,42 @@ class Band:
 
 
 @dataclass(frozen=True, slots=True)
+class SeasonWindow:
+    """A date window (month-day, may wrap the year end) that prices hours differently.
+
+    Divide-by-season is the norm in northern China: the same 08:00-20:00 block is
+    peak during the heating season and valley pricing shifts with it, so bands alone
+    cannot express a plan.
+    """
+
+    label: str
+    start: tuple[int, int]  # (month, day), inclusive
+    end: tuple[int, int]    # (month, day), inclusive
+    bands: tuple[Band, ...]
+
+    def covers(self, when: date | datetime) -> bool:
+        point = (when.month, when.day)
+        if self.start <= self.end:
+            return self.start <= point <= self.end
+        # e.g. 11-01 .. 03-31 crosses New Year
+        return point >= self.start or point <= self.end
+
+    @property
+    def range_label(self) -> str:
+        return f"{_format_monthday(self.start)}..{_format_monthday(self.end)}"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "label": self.label,
+            "start": _format_monthday(self.start),
+            "end": _format_monthday(self.end),
+            "bands": [band.to_dict() for band in self.bands],
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class TariffPlan:
-    """A named pricing plan: either one flat price or contiguous time bands."""
+    """A named pricing plan: flat price, time bands, and optional seasonal bands."""
 
     name: str
     kind: str  # "fixed" | "tou"
@@ -153,17 +213,28 @@ class TariffPlan:
     currency: str = "CNY"
     effective_from: str = ""
     plan_id: int | None = None
+    season: SeasonWindow | None = None  # 采暖期/非采暖期 两套时段
 
     @property
     def is_tou(self) -> bool:
         return self.kind == "tou"
 
+    def bands_for(self, ts: float) -> tuple[Band, ...]:
+        """Bands in force at ``ts`` (the season window wins inside its dates)."""
+        if not self.is_tou:
+            return ()
+        if self.season is not None and self.season.covers(datetime.fromtimestamp(ts)):
+            return self.season.bands
+        return self.bands
+
+    def in_season(self, ts: float) -> bool:
+        return self.season is not None and self.season.covers(datetime.fromtimestamp(ts))
+
     def price_at(self, ts: float) -> float:
         if not self.is_tou:
             return self.price
-        stamp = datetime.fromtimestamp(ts)
-        minute = stamp.hour * 60 + stamp.minute
-        for band in self.bands:
+        minute = datetime.fromtimestamp(ts).hour * 60 + datetime.fromtimestamp(ts).minute
+        for band in self.bands_for(ts):
             if band.start_min <= minute < band.end_min:
                 return band.price
         return 0.0
@@ -171,9 +242,8 @@ class TariffPlan:
     def band_name_at(self, ts: float) -> str:
         if not self.is_tou:
             return "统一电价"
-        stamp = datetime.fromtimestamp(ts)
-        minute = stamp.hour * 60 + stamp.minute
-        for band in self.bands:
+        minute = datetime.fromtimestamp(ts).hour * 60 + datetime.fromtimestamp(ts).minute
+        for band in self.bands_for(ts):
             if band.start_min <= minute < band.end_min:
                 return band.name
         return "未定义"
@@ -184,14 +254,41 @@ class TariffPlan:
             "price": self.price,
             "currency": self.currency,
             "bands": [band.to_dict() for band in self.bands],
+            "season": self.season.to_dict() if self.season is not None else None,
         }
+
+    def describe_lines(self) -> list[str]:
+        """One line per billing season, for terminals that wrap long lines badly."""
+        if not self.is_tou:
+            return [f"统一 {self.price:.{PRICE_DECIMALS}f} 元/kWh"]
+        if self.season is None:
+            return [_bands_text(self.bands)]
+        return [
+            f"其余日期（非采暖期）: {_bands_text(self.bands)}",
+            f"{self.season.label} {self.season.range_label}: {_bands_text(self.season.bands)}",
+        ]
 
     def describe(self) -> str:
         if not self.is_tou:
-            return f"{self.name}（统一 {self.price:.3f} 元/kWh）"
-        parts = ", ".join(f"{band.name} {_minutes_to_hm(band.start_min)}-{_minutes_to_hm(band.end_min)} {band.price:.2f}"
-                          for band in self.bands)
-        return f"{self.name}（{parts}）"
+            return f"{self.name}（统一 {self.price:.{PRICE_DECIMALS}f} 元/kWh）"
+        base = _bands_text(self.bands)
+        if self.season is None:
+            return f"{self.name}（{base}）"
+        return (
+            f"{self.name}（非采暖期 {base}；"
+            f"{self.season.label} {self.season.range_label} {_bands_text(self.season.bands)}）"
+        )
+
+
+def _bands_text(bands: Iterable[Band]) -> str:
+    return ", ".join(f"{band.name} {band.label} {band.price:.{PRICE_DECIMALS}f}" for band in bands)
+
+
+def _bands_from_config(items: Iterable[dict[str, Any]]) -> tuple[Band, ...]:
+    return tuple(
+        Band(_hm_to_minutes(item["start"]), _hm_to_minutes(item["end"]), item["name"], float(item["price"]))
+        for item in items
+    )
 
 
 def parse_band_spec(spec: str) -> tuple[Band, ...]:
@@ -236,11 +333,48 @@ def validate_bands(bands: Iterable[Band]) -> tuple[Band, ...]:
     return tuple(ordered)
 
 
+def validate_season(season: SeasonWindow) -> SeasonWindow:
+    """Reject a season window or band set that cannot be billed correctly."""
+    if not season.label.strip():
+        raise ValueError("季节名称不能为空")
+    return SeasonWindow(
+        label=season.label.strip(),
+        start=season.start,
+        end=season.end,
+        bands=validate_bands(season.bands),
+    )
+
+
+def parse_monthday(text: str) -> tuple[int, int]:
+    """Public wrapper for CLI/GUI input (``11-01``)."""
+    return _parse_monthday(text)
+
+
 def preset_plan(name: str = "示例：居民峰谷") -> TariffPlan:
     return TariffPlan(
         name=name,
         kind="tou",
         bands=parse_band_spec(CN_TOU_PRESET),
+        effective_from=date.today().isoformat(),
+    )
+
+
+def seasonal_preset(name: str = "示例：居民峰谷（含采暖期）") -> TariffPlan:
+    """Example plan shaped like a northern-China residential tariff (single tier).
+
+    Prices are placeholders for the single-tier residential rate; tiered billing
+    (第一/二/三档) is not modelled, so treat them as one reference tier.
+    """
+    return TariffPlan(
+        name=name,
+        kind="tou",
+        bands=parse_band_spec(CN_TOU_PRESET_NORMAL),
+        season=SeasonWindow(
+            label="采暖期",
+            start=(11, 1),
+            end=(3, 31),
+            bands=parse_band_spec(CN_TOU_PRESET_HEATING),
+        ),
         effective_from=date.today().isoformat(),
     )
 
@@ -372,26 +506,34 @@ class EnergyStore:
         self.close()
 
     # -- plan --------------------------------------------------------------
-    def active_plan(self) -> TariffPlan | None:
-        row = self._conn.execute(
-            "SELECT * FROM tariffs WHERE active = 1 ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-        if row is None:
-            return None
+    @staticmethod
+    def _plan_from_row(row: sqlite3.Row) -> TariffPlan:
         config = json.loads(row["config"])
-        bands = tuple(
-            Band(_hm_to_minutes(item["start"]), _hm_to_minutes(item["end"]), item["name"], float(item["price"]))
-            for item in config.get("bands", [])
-        )
+        season = None
+        raw_season = config.get("season")
+        if raw_season:
+            season = SeasonWindow(
+                label=raw_season.get("label", "采暖期"),
+                start=_parse_monthday(raw_season["start"]),
+                end=_parse_monthday(raw_season["end"]),
+                bands=_bands_from_config(raw_season.get("bands", [])),
+            )
         return TariffPlan(
             name=row["name"],
             kind=config.get("kind", "fixed"),
             price=float(config.get("price", 0.0)),
-            bands=bands,
+            bands=_bands_from_config(config.get("bands", [])),
             currency=config.get("currency", "CNY"),
             effective_from=row["effective_from"],
             plan_id=int(row["id"]),
+            season=season,
         )
+
+    def active_plan(self) -> TariffPlan | None:
+        row = self._conn.execute(
+            "SELECT * FROM tariffs WHERE active = 1 ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        return None if row is None else self._plan_from_row(row)
 
     def set_plan(self, plan: TariffPlan) -> TariffPlan:
         if plan.kind not in ("fixed", "tou"):
@@ -400,6 +542,17 @@ class EnergyStore:
             plan = TariffPlan(
                 name=plan.name, kind=plan.kind, price=plan.price,
                 bands=validate_bands(plan.bands), currency=plan.currency,
+                effective_from=plan.effective_from or date.today().isoformat(),
+                season=validate_season(plan.season) if plan.season is not None else None,
+            )
+        else:
+            if plan.season is not None:
+                raise ValueError("固定电价方案不支持采暖期时段")
+            if plan.price < 0:
+                raise ValueError("电价不能为负数")
+            plan = TariffPlan(
+                name=plan.name, kind=plan.kind, price=float(plan.price),
+                currency=plan.currency,
                 effective_from=plan.effective_from or date.today().isoformat(),
             )
         with self._conn:
@@ -418,6 +571,7 @@ class EnergyStore:
         stored = TariffPlan(
             name=plan.name, kind=plan.kind, price=plan.price, bands=plan.bands,
             currency=plan.currency, effective_from=plan.effective_from, plan_id=plan_id,
+            season=plan.season,
         )
         self._plan = stored
         self._plan_minute = None
@@ -425,21 +579,7 @@ class EnergyStore:
 
     def plans(self) -> list[TariffPlan]:
         rows = self._conn.execute("SELECT * FROM tariffs ORDER BY id DESC").fetchall()
-        plans: list[TariffPlan] = []
-        for row in rows:
-            config = json.loads(row["config"])
-            bands = tuple(
-                Band(_hm_to_minutes(b["start"]), _hm_to_minutes(b["end"]), b["name"], float(b["price"]))
-                for b in config.get("bands", [])
-            )
-            plans.append(
-                TariffPlan(
-                    name=row["name"], kind=config.get("kind", "fixed"), price=float(config.get("price", 0.0)),
-                    bands=bands, currency=config.get("currency", "CNY"),
-                    effective_from=row["effective_from"], plan_id=int(row["id"]),
-                )
-            )
-        return plans
+        return [self._plan_from_row(row) for row in rows]
 
     def _current_plan(self) -> TariffPlan:
         if self._plan is None:

@@ -27,7 +27,9 @@ from .config import (
 )
 from .energy import (
     DEFAULT_DB,
+    PRICE_DECIMALS,
     EnergyStore,
+    SeasonWindow,
     TariffPlan,
     fixed_plan,
     format_kwh,
@@ -35,7 +37,10 @@ from .energy import (
     local_day_end,
     local_day_start,
     parse_band_spec,
+    parse_monthday,
     preset_plan,
+    seasonal_preset,
+    validate_bands,
 )
 from .fan_curve import DEFAULT_CUSTOM_POINTS, resample_fan_curve
 from .protocol import (
@@ -704,28 +709,56 @@ def _cmd_energy_prune(args: argparse.Namespace) -> int:
 def _cmd_tariff_list(args: argparse.Namespace) -> int:
     with EnergyStore(args.db, create=False) as store:
         active = store.active_plan()
-        print(f"当前生效: {active.describe() if active else '(无方案)'}")
+        if active is None:
+            print("当前生效: (无方案)")
+        else:
+            print(f"当前生效: {active.name}（生效自 {active.effective_from}）")
+            for line in active.describe_lines():
+                print(f"  {line}")
         for plan in store.plans()[:12]:
             marker = "*" if active and plan.plan_id == active.plan_id else " "
-            print(f" {marker} #{plan.plan_id:<3} {plan.describe()}  生效自 {plan.effective_from}")
+            print(f" {marker} #{plan.plan_id:<3} {plan.name}  生效自 {plan.effective_from}")
         print("\n提示：内置方案价格为示例值，请按当地电价修改：himos-psu tariff set ...")
     return 0
+
+
+def _parse_heating_range(text: str) -> tuple[tuple[int, int], tuple[int, int]]:
+    start_text, sep, end_text = text.partition(":")
+    if not sep:
+        raise ValueError("--heating 需要 MM-DD:MM-DD 形式，例如 11-01:03-31")
+    return parse_monthday(start_text), parse_monthday(end_text)
 
 
 def _cmd_tariff_set(args: argparse.Namespace) -> int:
     choices = [bool(args.price is not None), bool(args.bands), bool(args.preset)]
     if sum(choices) != 1:
-        raise ValueError("请指定 --price（固定电价）或 --bands（峰谷时段）或 --preset cn 三者之一")
+        raise ValueError("请指定 --price（固定电价）或 --bands（峰谷时段）或 --preset 三者之一")
+    heating_args = [bool(args.heating), bool(args.heating_bands)]
+    if any(heating_args) and not all(heating_args):
+        raise ValueError("--heating 与 --heating-bands 必须同时给出")
     if args.price is not None:
+        if any(heating_args):
+            raise ValueError("固定电价方案不支持采暖期时段")
         plan = fixed_plan(args.name, args.price)
+    elif args.preset == "seasonal":
+        plan = seasonal_preset(args.name)
     elif args.preset:
         plan = preset_plan(args.name)
     else:
+        season = None
+        if args.heating:
+            start, end = _parse_heating_range(args.heating)
+            season = SeasonWindow(
+                label="采暖期", start=start, end=end,
+                bands=validate_bands(parse_band_spec(args.heating_bands)),
+            )
         plan = TariffPlan(name=args.name, kind="tou", bands=parse_band_spec(args.bands),
-                          effective_from=date.today().isoformat())
+                          season=season, effective_from=date.today().isoformat())
     with EnergyStore(args.db) as store:
         stored = store.set_plan(plan)
-        print(f"已保存电价方案: {stored.describe()}")
+        print(f"已保存电价方案: {stored.name}")
+        for line in stored.describe_lines():
+            print(f"  {line}")
         if args.recalc:
             rows = store.recalc_costs()
             print(f"已按新电价重算 {rows} 个分钟桶的历史费用。")
@@ -885,7 +918,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_ts.add_argument("--name", default="自定义方案")
     p_ts.add_argument("--price", type=float, help="固定电价（元/kWh）")
     p_ts.add_argument("--bands", help="峰谷时段，如 0-7:谷:0.32,7-10:平:0.58,10-24:峰:0.92")
-    p_ts.add_argument("--preset", choices=["cn"], help="使用内置示例峰谷方案")
+    p_ts.add_argument("--heating", metavar="MM-DD:MM-DD",
+                      help="采暖期日期范围，如 11-01:03-31（配合 --heating-bands）")
+    p_ts.add_argument("--heating-bands", help="采暖期使用的峰谷时段，格式同 --bands")
+    p_ts.add_argument("--preset", choices=["cn", "seasonal"],
+                      help="内置示例方案：cn=通用峰谷，seasonal=含采暖期")
     p_ts.add_argument("--recalc", action="store_true", help="保存后按新电价重算历史费用")
     p_ts.set_defaults(func=_cmd_tariff_set)
     p_tr = tsub.add_parser("recalc", help="按当前生效方案重算历史费用")

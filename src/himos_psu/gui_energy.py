@@ -6,6 +6,7 @@ import calendar
 import math
 import time
 from datetime import date, datetime, timedelta
+from html import escape
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -14,15 +15,22 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from .config import default_config_path, load_config, parse_saved_profile, save_config
 from .energy import (
     CN_TOU_PRESET,
-    EnergyStore,
-    TariffPlan,
+    CN_TOU_PRESET_HEATING,
+    PRICE_DECIMALS,
     Band,
+    EnergyStore,
+    SeasonWindow,
+    TariffPlan,
     format_duration,
     format_kwh,
     format_yuan,
     local_day_end,
     local_day_start,
     parse_band_spec,
+    parse_monthday,
+    preset_plan,
+    seasonal_preset,
+    validate_bands,
 )
 from .protocol import FanMode
 
@@ -408,13 +416,17 @@ class LoadBars(QtWidgets.QWidget):
 
 # --------------------------------------------------------------------------- tariff dialog
 class TariffDialog(QtWidgets.QDialog):
-    """Create/edit a tariff plan (fixed or time-of-use) and optionally recalc history."""
+    """Create/edit a tariff plan (fixed, time-of-use, optionally seasonal)."""
 
     def __init__(self, store: EnergyStore, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         self.store = store
         self.setWindowTitle("电价方案")
-        self.resize(560, 460)
+        self.resize(620, 560)
+        # Rows are kept per season so switching the editor never loses edits.
+        self._rows: dict[str, list[tuple[str, str, str, float]]] = {"normal": [], "heating": []}
+        self._editing = "normal"
+
         layout = QtWidgets.QVBoxLayout(self)
         layout.setSpacing(10)
 
@@ -424,20 +436,46 @@ class TariffDialog(QtWidgets.QDialog):
         self.kind_combo.addItem("固定电价（元/kWh）", "fixed")
         self.kind_combo.addItem("峰谷分时（尖/峰/平/谷）", "tou")
         self.price_spin = QtWidgets.QDoubleSpinBox()
-        self.price_spin.setDecimals(3)
+        self.price_spin.setDecimals(PRICE_DECIMALS)
         self.price_spin.setRange(0.0, 20.0)
-        self.price_spin.setSingleStep(0.01)
-        self.price_spin.setValue(0.55)
+        self.price_spin.setSingleStep(0.0001)
+        self.price_spin.setValue(0.5550)
         form.addRow("方案名称", self.name_edit)
         form.addRow("计费方式", self.kind_combo)
         form.addRow("固定单价", self.price_spin)
         layout.addLayout(form)
 
+        season_row = QtWidgets.QHBoxLayout()
+        self.season_check = QtWidgets.QCheckBox("区分采暖期（时段与电价不同）")
+        self.season_start_edit = QtWidgets.QLineEdit("11-01")
+        self.season_end_edit = QtWidgets.QLineEdit("03-31")
+        for edit in (self.season_start_edit, self.season_end_edit):
+            edit.setMaximumWidth(64)
+            edit.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        season_row.addWidget(self.season_check)
+        season_row.addSpacing(8)
+        season_row.addWidget(QtWidgets.QLabel("采暖期"))
+        season_row.addWidget(self.season_start_edit)
+        season_row.addWidget(QtWidgets.QLabel("至（次年）"))
+        season_row.addWidget(self.season_end_edit)
+        season_row.addStretch(1)
+        layout.addLayout(season_row)
+
+        editor_row = QtWidgets.QHBoxLayout()
+        editor_row.addWidget(QtWidgets.QLabel("正在编辑"))
+        self.season_combo = QtWidgets.QComboBox()
+        self.season_combo.addItem("非采暖期（其余日期）", "normal")
+        self.season_combo.addItem("采暖期", "heating")
+        editor_row.addWidget(self.season_combo)
+        editor_row.addStretch(1)
+        layout.addLayout(editor_row)
+
         self.table = QtWidgets.QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(["开始", "结束", "时段名", "单价"])
         self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
         self.table.verticalHeader().setVisible(False)
-        layout.addWidget(QtWidgets.QLabel("峰谷时段（必须从 00:00 连续覆盖到 24:00）"))
+        self.hint = QtWidgets.QLabel("峰谷时段（必须从 00:00 连续覆盖到 24:00）")
+        layout.addWidget(self.hint)
         layout.addWidget(self.table, 1)
 
         row = QtWidgets.QHBoxLayout()
@@ -457,7 +495,10 @@ class TariffDialog(QtWidgets.QDialog):
         self.recalc_check.setChecked(True)
         layout.addWidget(self.recalc_check)
 
-        note = QtWidgets.QLabel("价格为示例默认值，请按当地居民峰谷/阶梯电价填写；本工具只做价格计算，不联网查询。")
+        note = QtWidgets.QLabel(
+            "电价保留 4 位小数（如 0.5469）。价格为示例默认值，请按当地居民峰谷/阶梯电价填写；"
+            "本工具只做价格计算，不联网查询。"
+        )
         note.setWordWrap(True)
         note.setStyleSheet(f"color: {DIM}; font-size: 10px;")
         layout.addWidget(note)
@@ -470,32 +511,66 @@ class TariffDialog(QtWidgets.QDialog):
         layout.addWidget(buttons)
 
         self.kind_combo.currentIndexChanged.connect(self._sync_mode)
+        self.season_check.toggled.connect(self._on_season_toggled)
+        self.season_combo.currentIndexChanged.connect(self._on_season_editor_changed)
         self._load_plan(store.active_plan())
         self._sync_mode()
 
     # -- helpers -----------------------------------------------------------
     def _load_plan(self, plan: TariffPlan | None) -> None:
-        plan = plan or TariffPlan(name="我的电价", kind="fixed", price=0.55,
+        plan = plan or TariffPlan(name="我的电价", kind="fixed", price=0.5550,
                                   effective_from=date.today().isoformat())
         self.name_edit.setText(plan.name)
         self.kind_combo.setCurrentIndex(1 if plan.is_tou else 0)
-        self.price_spin.setValue(plan.price or 0.55)
+        self.price_spin.setValue(plan.price or 0.5550)
+        self._rows["normal"] = [_band_tuple(band) for band in plan.bands]
+        season = plan.season
+        self._rows["heating"] = [_band_tuple(band) for band in (season.bands if season else ())]
+        if season is not None:
+            self.season_start_edit.setText(f"{season.start[0]:02d}-{season.start[1]:02d}")
+            self.season_end_edit.setText(f"{season.end[0]:02d}-{season.end[1]:02d}")
+        # Block signals: rendering the table must not look like a user edit.
+        self.season_check.blockSignals(True)
+        self.season_check.setChecked(season is not None)
+        self.season_check.blockSignals(False)
+        self._editing = "normal"
+        self.season_combo.blockSignals(True)
+        self.season_combo.setCurrentIndex(0)
+        self.season_combo.blockSignals(False)
+        self._render_table("normal")
+
+    def _render_table(self, key: str) -> None:
         self.table.setRowCount(0)
-        for band in plan.bands:
-            self._append_row(f"{band.start_min // 60:02d}:{band.start_min % 60:02d}",
-                             f"{band.end_min // 60:02d}:{band.end_min % 60:02d}",
-                             band.name, band.price)
+        for start, end, name, price in self._rows[key]:
+            self._append_row(start, end, name, price)
+        self.hint.setText(
+            "采暖期峰谷时段（必须从 00:00 连续覆盖到 24:00）" if key == "heating"
+            else "非采暖期峰谷时段（必须从 00:00 连续覆盖到 24:00）"
+        )
 
     def _append_row(self, start: str, end: str, name: str, price: float) -> None:
         row = self.table.rowCount()
         self.table.insertRow(row)
-        for col, text in enumerate((start, end, name, f"{price:.3f}")):
+        for col, text in enumerate((start, end, name, f"{price:.{PRICE_DECIMALS}f}")):
             item = QtWidgets.QTableWidgetItem(str(text))
             item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
             self.table.setItem(row, col, item)
 
+    def _capture_table(self) -> list[tuple[str, str, str, float]]:
+        rows: list[tuple[str, str, str, float]] = []
+        for index in range(self.table.rowCount()):
+            try:
+                start = self.table.item(index, 0).text().strip()
+                end = self.table.item(index, 1).text().strip()
+                name = self.table.item(index, 2).text().strip() or "平"
+                price = float(self.table.item(index, 3).text().strip())
+            except (AttributeError, ValueError):
+                continue  # 保留原值：非法行在保存时统一报错
+            rows.append((start, end, name, price))
+        return rows
+
     def _add_row(self) -> None:
-        self._append_row("00:00", "24:00", "平", 0.55)
+        self._append_row("00:00", "24:00", "平", 0.5550)
 
     def _del_row(self) -> None:
         row = self.table.currentRow()
@@ -504,41 +579,73 @@ class TariffDialog(QtWidgets.QDialog):
 
     def _load_preset(self) -> None:
         self.kind_combo.setCurrentIndex(1)
-        self.table.setRowCount(0)
-        for band in parse_band_spec(CN_TOU_PRESET):
-            self._append_row(f"{band.start_min // 60:02d}:{band.start_min % 60:02d}",
-                             f"{band.end_min // 60:02d}:{band.end_min % 60:02d}",
-                             band.name, band.price)
+        if self.season_check.isChecked():
+            plan = seasonal_preset()
+            self._rows["normal"] = [_band_tuple(band) for band in plan.bands]
+            self._rows["heating"] = [_band_tuple(band) for band in plan.season.bands]  # type: ignore[union-attr]
+        else:
+            self._rows["normal"] = [_band_tuple(band) for band in preset_plan().bands]
+        self._render_table(self._editing)
+
+    def _on_season_toggled(self, enabled: bool) -> None:
+        if enabled and not self._rows["heating"]:
+            # Seed the heating table so the user edits values instead of typing bands.
+            self._rows["heating"] = [_band_tuple(band) for band in parse_band_spec(CN_TOU_PRESET_HEATING)]
+        self._sync_mode()
+
+    def _on_season_editor_changed(self) -> None:
+        self._rows[self._editing] = self._capture_table()
+        self._editing = "heating" if self.season_combo.currentData() == "heating" else "normal"
+        self._render_table(self._editing)
 
     def _sync_mode(self) -> None:
         tou = self.kind_combo.currentData() == "tou"
+        seasonal = tou and self.season_check.isChecked()
         self.price_spin.setEnabled(not tou)
         self.table.setEnabled(tou)
         for widget in (self.add_btn, self.del_btn, self.preset_btn):
             widget.setEnabled(tou)
+        for widget in (self.season_check,):
+            widget.setEnabled(tou)
+        for widget in (self.season_start_edit, self.season_end_edit, self.season_combo):
+            widget.setEnabled(seasonal)
+        if not tou:
+            self.hint.setText("固定电价无需时段")
+        else:
+            self.hint.setText(
+                ("采暖期" if self._editing == "heating" else "非采暖期")
+                + "峰谷时段（必须从 00:00 连续覆盖到 24:00）"
+            )
 
-    def _collect_bands(self) -> tuple[Band, ...]:
+    def _collect_bands(self, key: str) -> tuple[Band, ...]:
+        source = self._capture_table() if key == self._editing else self._rows[key]
         bands: list[Band] = []
-        for row in range(self.table.rowCount()):
+        for index, (start, end, name, price) in enumerate(source):
             try:
-                start_text = self.table.item(row, 0).text().strip()
-                end_text = self.table.item(row, 1).text().strip()
-                name = self.table.item(row, 2).text().strip() or "平"
-                price = float(self.table.item(row, 3).text().strip())
-            except (AttributeError, ValueError) as exc:
-                raise ValueError(f"第 {row + 1} 行格式不正确") from exc
-            bands.append(Band(parse_hm(start_text), parse_hm(end_text), name, price))
+                bands.append(Band(parse_hm(start), parse_hm(end), name, price))
+            except ValueError as exc:
+                raise ValueError(f"第 {index + 1} 行格式不正确: {exc}") from exc
         return tuple(bands)
+
+    def _build_season(self) -> SeasonWindow | None:
+        if not self.season_check.isChecked():
+            return None
+        start = parse_monthday(self.season_start_edit.text() or "11-01")
+        end = parse_monthday(self.season_end_edit.text() or "03-31")
+        return SeasonWindow(label="采暖期", start=start, end=end, bands=validate_bands(self._collect_bands("heating")))
 
     def _save(self) -> None:
         kind = self.kind_combo.currentData()
         try:
             if kind == "tou":
-                plan = TariffPlan(name=self.name_edit.text().strip() or "峰谷方案", kind="tou",
-                                  bands=self._collect_bands(), effective_from=date.today().isoformat())
-                from .energy import validate_bands
-
-                validate_bands(plan.bands)
+                season = self._build_season()
+                plan = TariffPlan(
+                    name=self.name_edit.text().strip() or "峰谷方案",
+                    kind="tou",
+                    bands=validate_bands(self._collect_bands("normal")),
+                    season=season,
+                    effective_from=date.today().isoformat(),
+                )
             else:
                 plan = TariffPlan(name=self.name_edit.text().strip() or "固定电价", kind="fixed",
                                   price=self.price_spin.value(), effective_from=date.today().isoformat())
@@ -549,6 +656,12 @@ class TariffDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(self, "保存失败", str(exc))
             return
         self.accept()
+
+
+def _band_tuple(band: Band) -> tuple[str, str, str, float]:
+    start = f"{band.start_min // 60:02d}:{band.start_min % 60:02d}"
+    end = f"{band.end_min // 60:02d}:{band.end_min % 60:02d}"
+    return start, end, band.name, band.price
 
 
 def parse_hm(text: str) -> int:
@@ -802,10 +915,18 @@ class EnergyTab(QtWidgets.QWidget):
         self.donut.set_data(slices, f"{month.kwh:.2f}", "kWh", format_yuan(month.cost_cents))
         plan = store.active_plan()
         if plan and plan.is_tou:
-            prices = " · ".join(f"{b.name} {b.price:.2f}" for b in plan.bands)
-            self.band_note.setText(f"当前电价（元/kWh）：{prices}")
+            prices = " · ".join(f"{b.name} {b.price:.{PRICE_DECIMALS}f}" for b in plan.bands)
+            if plan.season is not None:
+                winter = " · ".join(
+                    f"{b.name} {b.price:.{PRICE_DECIMALS}f}" for b in plan.season.bands
+                )
+                self.band_note.setText(
+                    f"当前电价（元/kWh）非采暖期：{prices}；{plan.season.label}：{winter}"
+                )
+            else:
+                self.band_note.setText(f"当前电价（元/kWh）：{prices}")
         elif plan:
-            self.band_note.setText(f"当前电价：统一 {plan.price:.3f} 元/kWh")
+            self.band_note.setText(f"当前电价：统一 {plan.price:.{PRICE_DECIMALS}f} 元/kWh")
 
     def _refresh_calendar(self) -> None:
         assert self._store is not None
@@ -1041,7 +1162,13 @@ class SettingsTab(QtWidgets.QWidget):
             return
         try:
             plan = store.active_plan()
-            self.plan_label.setText(plan.describe() if plan else "尚未设置")
+            if plan is None:
+                self.plan_label.setText("尚未设置")
+            else:
+                self.plan_label.setWordWrap(True)
+                # Rich text: escape the plan text, then join the seasons with <br>.
+                body = "<br>".join(escape(line) for line in plan.describe_lines())
+                self.plan_label.setText(f"{escape(plan.name)}<br>{body}")
             self.carbon_spin.setValue(store.carbon_factor)
             first = store.first_ts()
             size_mb = store.db_size() / 1024 / 1024
