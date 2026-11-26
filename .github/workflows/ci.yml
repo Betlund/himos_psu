@@ -47,6 +47,12 @@ jobs:
       - name: Unit tests
         run: python -m unittest discover -s tests -v
 
+      # 与本地（UTC+8）互换时区再跑一遍：时间相关的断言两边都要成立。
+      - name: Unit tests (Asia/Shanghai)
+        env:
+          TZ: Asia/Shanghai
+        run: python -m unittest discover -s tests
+
       - name: Privacy scan (worktree + full history)
         run: python tools/privacy_scan.py --all
 

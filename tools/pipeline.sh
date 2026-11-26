@@ -25,11 +25,14 @@ run_stage() {
 
 stage_compile() { "$PY" -m compileall -q src tests tools; }
 stage_tests()   { "$PY" -m unittest discover -s tests 2>&1 | tail -4; }
+# 本地是 UTC+8，CI runner 是 UTC；时区相关的断言必须在两种时区下都通过。
+stage_tests_utc() { TZ=UTC "$PY" -m unittest discover -s tests 2>&1 | tail -4; }
 stage_privacy() { "$PY" tools/privacy_scan.py --worktree --staged; }
 stage_history() { "$PY" tools/privacy_scan.py --history --messages; }
 
 run_stage "语法检查 (compileall)" stage_compile
 run_stage "单元测试 (unittest)" stage_tests
+run_stage "单元测试 (unittest, TZ=UTC)" stage_tests_utc
 run_stage "隐私扫描 (工作区 + 暂存区)" stage_privacy
 if [ "$QUICK" -eq 0 ]; then
     run_stage "隐私扫描 (全历史 + 提交信息)" stage_history

@@ -69,6 +69,8 @@
 
 ### 工程
 
+- 测试在**两个时区**下各跑一遍：本地流水线新增 `TZ=UTC` 一轮，CI 在 UTC 之外再补一轮
+  `TZ=Asia/Shanghai`。上一版 5 分钟视图的断言按本地傍晚估算格数，UTC runner 上只有 178 格而失败。
 - 抽 `EnergyStore.power_series(start, end, step_s)`：按固定步长聚合分钟桶的平均/最小/最大功率，
   覆盖率不足的格子返回 `None` 而不是伪造 0 W；`hourly_watts()` 保留给旧调用。
 - 统一 `ExecStart` 的路径处理为 `_systemd_exec()`（原先三处各写一遍 `$HOME` → `%h` 的转换），
