@@ -491,6 +491,11 @@ class EnergyStore:
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(energy_minute)")}
         if "cov_s" not in columns:  # v1 databases only stored ws/n/gap
             self._conn.execute("ALTER TABLE energy_minute ADD COLUMN cov_s REAL NOT NULL DEFAULT 0")
+        session_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(sessions)")}
+        if "closed" not in session_columns:
+            # Existing rows are history, so default them to closed; the collector
+            # opens new sessions with closed = 0 and flips it in close_session().
+            self._conn.execute("ALTER TABLE sessions ADD COLUMN closed INTEGER NOT NULL DEFAULT 1")
 
     # -- lifecycle ---------------------------------------------------------
     def close(self) -> None:
@@ -688,7 +693,8 @@ class EnergyStore:
 
     def _open_session(self, ts_i: int, power: float) -> int:
         cur = self._conn.execute(
-            "INSERT INTO sessions(start_ts, end_ts, ws, peak_w, n) VALUES(?,?,0,?,1)", (ts_i, ts_i, power)
+            "INSERT INTO sessions(start_ts, end_ts, ws, peak_w, n, closed) VALUES(?,?,0,?,1,0)",
+            (ts_i, ts_i, power),
         )
         return int(cur.lastrowid)
 
@@ -697,7 +703,10 @@ class EnergyStore:
             return
         end = int(self._last_ts or time.time())
         with self._conn:
-            self._conn.execute("UPDATE sessions SET end_ts = MAX(end_ts, ?) WHERE id = ?", (end, self._session_id))
+            self._conn.execute(
+                "UPDATE sessions SET end_ts = MAX(end_ts, ?), closed = 1 WHERE id = ?",
+                (end, self._session_id),
+            )
         self._session_id = None
 
     def prune_raw(self, days: int = RAW_RETENTION_DAYS, now: float | None = None) -> int:
@@ -942,8 +951,15 @@ class EnergyStore:
             "SELECT * FROM sessions ORDER BY start_ts DESC LIMIT ?", (int(limit),)
         ).fetchall()
         out: list[dict[str, Any]] = []
+        now = time.time()
         for row in rows:
             duration = max(0, int(row["end_ts"]) - int(row["start_ts"]))
+            # A crashed collector leaves closed = 0 behind, so also require that the
+            # session is still being extended; otherwise it reads as "至今" forever.
+            # Read-only connections may predate the column (the GUI never migrates);
+            # in that case fall back to "still receiving data" alone.
+            closed = bool(row["closed"]) if "closed" in row.keys() else False
+            ongoing = not closed and (now - int(row["end_ts"])) < 300
             out.append(
                 {
                     "start_ts": int(row["start_ts"]),
@@ -951,6 +967,7 @@ class EnergyStore:
                     "duration_s": duration,
                     "kwh": float(row["ws"]) / WS_PER_KWH,
                     "peak_w": float(row["peak_w"]),
+                    "ongoing": ongoing,
                 }
             )
         return out
@@ -959,13 +976,34 @@ class EnergyStore:
         row = self._conn.execute("SELECT MIN(ts) AS ts FROM energy_minute").fetchone()
         return int(row["ts"]) if row and row["ts"] is not None else None
 
-    def recorded_days(self) -> int:
-        """Distinct calendar days that actually contain energy data."""
+    #: A day counts as "recorded" once it has this many minutes of real samples;
+    #: a stray minute from an experiment should not define "记录起点".
+    MEANINGFUL_MINUTES = 10
+
+    def _recorded_day_expr(self) -> str:
+        return "date(ts, 'unixepoch', 'localtime')"
+
+    def recorded_days(self, min_minutes: int | None = None) -> int:
+        """Calendar days with at least ``min_minutes`` minutes of real data."""
+        threshold = self.MEANINGFUL_MINUTES if min_minutes is None else max(1, int(min_minutes))
         row = self._conn.execute(
-            "SELECT COUNT(DISTINCT date(ts, 'unixepoch', 'localtime')) AS n"
-            " FROM energy_minute WHERE ws > 0"
+            f"SELECT COUNT(*) AS n FROM ("
+            f"  SELECT {self._recorded_day_expr()} AS d FROM energy_minute"
+            f"  WHERE cov_s > 0 GROUP BY d HAVING COUNT(*) >= ?)",
+            (threshold,),
         ).fetchone()
         return int(row["n"]) if row and row["n"] is not None else 0
+
+    def recording_start_ts(self, min_minutes: int | None = None) -> int | None:
+        """First minute of the first day that was actually recorded (not a blip)."""
+        threshold = self.MEANINGFUL_MINUTES if min_minutes is None else max(1, int(min_minutes))
+        row = self._conn.execute(
+            f"SELECT MIN(ts) AS ts FROM energy_minute WHERE cov_s > 0 AND {self._recorded_day_expr()} IN ("
+            f"  SELECT {self._recorded_day_expr()} AS d FROM energy_minute"
+            f"  WHERE cov_s > 0 GROUP BY d HAVING COUNT(*) >= ?)",
+            (threshold,),
+        ).fetchone()
+        return int(row["ts"]) if row and row["ts"] is not None else None
 
     def last_sample_ts(self) -> int | None:
         row = self._conn.execute("SELECT MAX(ts) AS ts FROM samples").fetchone()

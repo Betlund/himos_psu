@@ -304,8 +304,13 @@ class DaySelectionTestCase(unittest.TestCase):
                 self.assertEqual(tab._range, "day")
                 self.assertEqual(tab.range_combo.currentData(), "day")
                 self.assertIn(day.strftime("%Y-%m-%d"), tab.chart._caption)
+                self.assertIn("kWh", tab.chart._caption)
+                self.assertIn("¥", tab.chart._caption)
                 self.assertIn(day.strftime("%Y-%m-%d"), tab.cal_note.text())
                 self.assertIn("再点一次取消", tab.cal_note.text())
+                self.assertGreaterEqual(tab.sessions.rowCount(), 1)
+                # 这段数据是测试自己写完就关掉的，所以会话是「已结束」：应显示起止时间
+                self.assertIn("→", tab.sessions.item(0, 0).text())
 
                 tab._on_day_clicked(day)  # 再点一次取消
                 self.assertIsNone(tab._selected_day)
@@ -422,6 +427,38 @@ class ChartHoverTestCase(unittest.TestCase):
                 tab.deleteLater()
                 QtWidgets.QApplication.processEvents()
                 del tab
+
+
+class OngoingSessionTestCase(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    def test_running_collector_shows_a_session_open_until_now(self) -> None:
+        """A session that is still being written must read "至今", not a frozen end."""
+        from himos_psu.gui_energy import EnergyTab
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "energy.db"
+            store = EnergyStore(db)  # 保持打开，模拟守护进程仍在采集
+            tab = None
+            try:
+                now = int(time.time())
+                store.add_sample(now, status(180.0))
+                store.add_sample(now + 2, status(180.0))
+                tab = EnergyTab(db)
+                tab.refresh()
+                self.assertGreaterEqual(tab.sessions.rowCount(), 1)
+                self.assertIn("至今", tab.sessions.item(0, 0).text())
+                self.assertIn("⁺", tab.sessions.item(0, 1).text())
+            finally:
+                if tab is not None:
+                    tab._timer.stop()
+                    tab.close()
+                    tab.deleteLater()
+                    QtWidgets.QApplication.processEvents()
+                    del tab
+                store.close()
 
 
 if __name__ == "__main__":

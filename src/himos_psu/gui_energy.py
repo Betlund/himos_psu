@@ -1002,7 +1002,11 @@ class EnergyTab(QtWidgets.QWidget):
         sess_title.setObjectName("cardTitle")
         sess_layout.addWidget(sess_title)
         self.sessions = QtWidgets.QTableWidget(0, 4)
-        self.sessions.setHorizontalHeaderLabels(["时间", "时长", "用电", "费用"])
+        self.sessions.setHorizontalHeaderLabels(["时段", "时长", "用电", "费用"])
+        self.sessions.setToolTip(
+            "一段「供电会话」= 连续供电的一次开机；超过 60 秒没有新数据就断开、"
+            "下一次通电另算一段。「至今」表示还在运行。"
+        )
         header = self.sessions.horizontalHeader()
         header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
         for col in (1, 2, 3):
@@ -1011,6 +1015,10 @@ class EnergyTab(QtWidgets.QWidget):
         self.sessions.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.sessions.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
         sess_layout.addWidget(self.sessions, 1)
+        self.sessions_note = QtWidgets.QLabel("会话=连续供电的一段；超过 60 秒无数据即断开，"
+                                              "「至今」表示仍在采集")
+        self.sessions_note.setObjectName("hint")
+        sess_layout.addWidget(self.sessions_note)
         bottom.addWidget(sess_card, 2)
         root.addLayout(bottom, 3)
 
@@ -1088,7 +1096,7 @@ class EnergyTab(QtWidgets.QWidget):
         month_start = local_day_start(date.today().replace(day=1))
         month = store.report("本月", month_start, end)
 
-        first = store.first_ts()
+        first = store.recording_start_ts() or store.first_ts()
         total = store.report("累计", local_day_start(datetime.fromtimestamp(first).date()) if first else start, end)
 
         self.kpi_today.set(format_kwh(today.kwh), "kWh",
@@ -1104,8 +1112,8 @@ class EnergyTab(QtWidgets.QWidget):
         self.kpi_total.set(format_kwh(total.kwh), "kWh",
                            f"自 {since} 起 · 已记录 {recorded} 天", PURPLE)
         self.kpi_total.setToolTip(
-            f"累计区间从首个有数据的分钟（{since}）到今天；其间实际有数据的是 {recorded} 天，"
-            "没开采集的日子不计入。"
+            f"累计从 {since} 开始（首个真正采集过的日子）到今天；其间有数据的是 {recorded} 天，"
+            f"没开采集的日子不计入，少于 {store.MEANINGFUL_MINUTES} 分钟的零散记录也不算一天。"
         )
         peak_ratio = (today.peak_w / self._rated_w * 100.0) if self._rated_w else 0.0
         active = store.active_seconds(start, end)
@@ -1122,7 +1130,12 @@ class EnergyTab(QtWidgets.QWidget):
                 day = self._selected_day or today
                 step, start = 3600, local_day_start(day)
                 end = min(local_day_end(day), int(time.time()))
-                caption = f"{day:%Y-%m-%d} 每小时平均功率，缺口留空"
+                day_report = store.report("选中日", start, end)
+                caption = (
+                    f"{day:%Y-%m-%d} · 共 {format_kwh(day_report.kwh)} kWh"
+                    f" · {format_yuan(day_report.cost_cents)}"
+                    f" · 峰值 {day_report.peak_w:.0f} W · 每小时平均功率"
+                )
                 peak_prefix = "小时均值峰值"
             else:
                 step = 300 if self._range == "fine" else 3600
@@ -1248,15 +1261,20 @@ class EnergyTab(QtWidgets.QWidget):
         for row, item in enumerate(sessions):
             start = datetime.fromtimestamp(item["start_ts"])
             end = datetime.fromtimestamp(item["end_ts"])
-            span = f"{start:%m-%d %H:%M}"
+            # 结束时间必须写出来：只显示起点会让一段跨夜会话看起来“停在昨天”。
+            tail = "至今" if item["ongoing"] else f"{end:%H:%M}"
+            span = f"{start:%m-%d %H:%M} → {tail}"
+            duration = format_duration(item["duration_s"]) + ("⁺" if item["ongoing"] else "")
             report = self._store.report("会话", item["start_ts"], item["end_ts"] + 1)
-            values = [span, format_duration(item["duration_s"]), f"{item['kwh']:.2f} kWh",
-                      format_yuan(report.cost_cents)]
+            values = [span, duration, f"{item['kwh']:.2f} kWh", format_yuan(report.cost_cents)]
             for col, value in enumerate(values):
                 cell = QtWidgets.QTableWidgetItem(value)
                 cell.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
                 if col == 0:
-                    cell.setToolTip(f"{start:%Y-%m-%d %H:%M} → {end:%H:%M}")
+                    cell.setToolTip(
+                        f"{start:%Y-%m-%d %H:%M} → "
+                        + ("现在（仍在采集）" if item["ongoing"] else f"{end:%Y-%m-%d %H:%M}")
+                    )
                 self.sessions.setItem(row, col, cell)
 
     def _refresh_status(self) -> None:

@@ -90,7 +90,9 @@ class EnergyStoreTestCase(unittest.TestCase):
             self.store.add_sample(BASE + 9 * 3600 + offset, sample(100.0))
         for offset in (0, 2):  # one interval on day B
             self.store.add_sample(BASE + 86400 + 10 * 3600 + offset, sample(100.0))
-        self.assertEqual(self.store.recorded_days(), 2)
+        # 默认阈值是 10 分钟，两天都只有 1 分钟；放宽阈值才都算一天
+        self.assertEqual(self.store.recorded_days(), 0)
+        self.assertEqual(self.store.recorded_days(min_minutes=1), 2)
 
     def test_report_exposes_measured_span(self) -> None:
         """Coverage is relative to the recorded span, which must be visible."""
@@ -132,6 +134,23 @@ class EnergyStoreTestCase(unittest.TestCase):
         self.assertAlmostEqual(report.gap_s, 30.0, places=3)
         self.assertEqual(report.covered_s, 0.0)
 
+    def test_recorded_day_ignores_a_stray_minute(self) -> None:
+        """One leftover minute must not define "recording since"."""
+        self.store.set_plan(fixed_plan("测试", 0.5))
+        for offset in (0, 2):  # one minute on a lonely day
+            self.store.add_sample(BASE, sample(100.0))
+            self.store.add_sample(BASE + offset, sample(100.0))
+        day_two = BASE + 86400
+        for minute in range(12):  # twelve minutes on the next day
+            base = day_two + minute * 60
+            self.store.add_sample(base, sample(100.0))
+            self.store.add_sample(base + 2, sample(100.0))
+        self.assertEqual(self.store.recorded_days(), 1)
+        self.assertEqual(self.store.recording_start_ts(), day_two)
+        # 阈值降到 1 分钟就都算了，起点回到第一天
+        self.assertEqual(self.store.recorded_days(min_minutes=1), 2)
+        self.assertEqual(self.store.recording_start_ts(min_minutes=1), BASE)
+
     def test_session_split_on_long_gap(self) -> None:
         self.store.add_sample(BASE, sample(100.0))
         self.store.add_sample(BASE + 5, sample(100.0))
@@ -139,6 +158,17 @@ class EnergyStoreTestCase(unittest.TestCase):
         sessions = self.store.recent_sessions(10)
         self.assertEqual(len(sessions), 2)
         self.assertEqual(sessions[0]["start_ts"], BASE + 200)
+
+    def test_session_ongoing_flag(self) -> None:
+        # 进行中同时看 closed 标志与「最近还在写入」，所以要用当前时间
+        now = int(time.time())
+        self.store.add_sample(now, sample(100.0))
+        self.store.add_sample(now + 2, sample(100.0))
+        sessions = self.store.recent_sessions(5)
+        self.assertTrue(sessions[0]["ongoing"], "刚写入的会话应视为进行中")
+        self.store.close_session()
+        sessions = self.store.recent_sessions(5)
+        self.assertFalse(sessions[0]["ongoing"], "close_session() 之后应结束")
 
     def test_active_seconds_uses_threshold(self) -> None:
         for i in range(61):
