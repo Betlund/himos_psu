@@ -230,8 +230,9 @@ curl -s 'localhost:8790/v1/history?hours=24&step=300'
 ```
 
 端点有 `/v1/status`、`/v1/history`、`/v1/energy`、`/v1/meta`、`/v1/health` 和 Prometheus 的 `/metrics`；
-只绑 `127.0.0.1`、只读，可用 `--http-token` 加 Bearer 鉴权。完整字段与各语言示例见
-[docs/api.md](docs/api.md)，轮询示例见 [examples/api_poll.py](examples/api_poll.py)。
+只绑 `127.0.0.1`、只读，可用 `--http-token` 加 Bearer 鉴权。字段与各语言示例见
+[docs/api.md](docs/api.md)，给自动化程序/AI 代理用的纯字段速查表见
+[docs/api-reference.md](docs/api-reference.md)，轮询示例见 [examples/api_poll.py](examples/api_poll.py)。
 
 不开端口也可以走原有 Unix socket：`{"cmd": "query", "what": "status"}` 返回同样结构的 JSON。
 

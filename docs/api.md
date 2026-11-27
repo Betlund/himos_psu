@@ -22,7 +22,7 @@ systemctl --user restart himos-psu-collect
 ```
 
 需要鉴权时加 `--http-token <一串随机字符>`，之后请求要带
-`Authorization: Bearer <token>`（也可以 `?token=`，但日志里会留痕，不推荐）。
+`Authorization: Bearer <token>`（只支持请求头，不接受 URL 参数）。
 
 ## 端点
 
@@ -86,7 +86,7 @@ systemctl --user restart himos-psu-collect
 {
   "schema": 1, "range": "today",
   "kwh": 1.5615, "cost_yuan": 0.867, "avg_w": 145.6, "peak_w": 414.6,
-  "coverage": 1.0, "gap_s": 0.0,
+  "coverage": 1.0, "gap_s": 0.0, "active_s": 38618.0,
   "start": "2026-11-27T00:00:00", "end": "2026-11-27T10:43:39",
   "first_sample_at": "2026-11-27T00:00:00"
 }

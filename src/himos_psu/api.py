@@ -137,6 +137,8 @@ def energy_payload(store: EnergyStore, range_name: str, with_bands: bool = False
     report = store.report(RANGE_LABELS[key], start, end)
     payload = _energy_payload(report, key)
     payload["schema"] = SCHEMA_VERSION
+    # Seconds the machine actually drew >20 W; differs from the covered span.
+    payload["active_s"] = round(store.active_seconds(start, end), 1)
     if with_bands:
         payload["bands"] = store.band_breakdown(start, end)
     return payload
@@ -174,7 +176,6 @@ def _energy_payload(report: Any, label: str) -> dict[str, Any]:
         "peak_w": round(report.peak_w, 1),
         "coverage": round(report.coverage, 4),
         "gap_s": round(report.gap_s, 1),
-        "runtime_s": None,
         "start": datetime.fromtimestamp(report.start_ts).isoformat(timespec="seconds"),
         "end": datetime.fromtimestamp(report.end_ts).isoformat(timespec="seconds"),
         "first_sample_at": (

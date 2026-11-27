@@ -133,12 +133,21 @@ class HttpApiTestCase(unittest.TestCase):
         self.assertEqual(code, 400)
         self.assertIn("step", payload["error"])
 
+    def test_history_rejects_absurd_windows(self) -> None:
+        code, payload = self.get("/v1/history?hours=400")
+        self.assertEqual(code, 400)
+        self.assertIn("hours", payload["error"])
+        code, _payload = self.get("/v1/history?hours=0")
+        self.assertEqual(code, 400)
+
     def test_energy_range_and_bands(self) -> None:
         code, payload = self.get("/v1/energy?range=today")
         self.assertEqual(code, 200)
         self.assertGreater(payload["kwh"], 0.0)
         self.assertGreater(payload["cost_yuan"], 0.0)
         self.assertEqual(payload["range"], "today")
+        self.assertIn("active_s", payload)
+        self.assertGreaterEqual(payload["active_s"], 0.0)
 
         code, payload = self.get("/v1/energy?range=today&bands=1")
         self.assertEqual(code, 200)
