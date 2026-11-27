@@ -1008,9 +1008,12 @@ class EnergyTab(QtWidgets.QWidget):
             "下一次通电另算一段。「至今」表示还在运行。"
         )
         header = self.sessions.horizontalHeader()
-        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        # 时段 gets the remaining width (numbers keep their natural size); sizing every
+        # column to content pushed 费用 out of the ~360px card.
         for col in (1, 2, 3):
             header.setSectionResizeMode(col, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        header.setMinimumSectionSize(38)
         self.sessions.verticalHeader().setVisible(False)
         self.sessions.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.sessions.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
@@ -1019,7 +1022,7 @@ class EnergyTab(QtWidgets.QWidget):
                                               "「至今」表示仍在采集")
         self.sessions_note.setObjectName("hint")
         sess_layout.addWidget(self.sessions_note)
-        bottom.addWidget(sess_card, 2)
+        bottom.addWidget(sess_card, 3)
         root.addLayout(bottom, 3)
 
         footer = QtWidgets.QHBoxLayout()
@@ -1263,7 +1266,7 @@ class EnergyTab(QtWidgets.QWidget):
             end = datetime.fromtimestamp(item["end_ts"])
             # 结束时间必须写出来：只显示起点会让一段跨夜会话看起来“停在昨天”。
             tail = "至今" if item["ongoing"] else f"{end:%H:%M}"
-            span = f"{start:%m-%d %H:%M} → {tail}"
+            span = f"{start:%m-%d %H:%M}→{tail}"  # compact: the card is only ~360px wide
             duration = format_duration(item["duration_s"]) + ("⁺" if item["ongoing"] else "")
             report = self._store.report("会话", item["start_ts"], item["end_ts"] + 1)
             values = [span, duration, f"{item['kwh']:.2f} kWh", format_yuan(report.cost_cents)]
