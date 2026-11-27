@@ -29,7 +29,9 @@ RULES: tuple[tuple[str, re.Pattern[str], frozenset[str]], ...] = (
     ("serial-number", re.compile(r"\bSBRC[A-Z0-9]{11}\b"), frozenset({"SBRC00000000123"})),
     ("edition-badge", re.compile(r"No\.\s?\d{1,4}\s?/\s?1000"), frozenset({"No.123/1000"})),
     ("home-path", re.compile(r"/(?:home|Users)/[A-Za-z0-9._-]+"), frozenset()),
-    ("private-ip", re.compile(r"\b(?:10|127)\.\d{1,3}\.\d{1,3}\.\d{1,3}\b|"
+    # Loopback (127/8) is not private information — docs and tests legitimately use
+    # 127.0.0.1 — so only LAN ranges are flagged.
+    ("private-ip", re.compile(r"\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b|"
                               r"\b192\.168\.\d{1,3}\.\d{1,3}\b|"
                               r"\b172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b"), frozenset()),
     ("email", re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),

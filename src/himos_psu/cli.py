@@ -383,6 +383,8 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         stale_timeout=args.stale_timeout,
         config_path=args.config,
         quiet=args.quiet,
+        http_port=getattr(args, "http_port", 0),
+        http_token=getattr(args, "http_token", None),
         on_log=log,
     )
     try:
@@ -412,7 +414,9 @@ def _daemon_unit_text(args: argparse.Namespace) -> str:
         # No --quiet: under systemd the journal is the only place the daemon can
         # explain itself, and "exited status=1" without a reason is undebuggable.
         f"ExecStart={exec_bin} daemon --wait-port {max(0.0, args.wait_port):g}"
-        f" --stale-timeout {max(0.0, args.stale_timeout):g}\n"
+        f" --stale-timeout {max(0.0, args.stale_timeout):g}"
+        + (f" --http-port {int(args.http_port):d}" if getattr(args, "http_port", 0) else "")
+        + "\n"
         "Restart=always\n"
         "RestartSec=5\n"
         "\n"
@@ -946,6 +950,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_daemon.add_argument("--stale-timeout", type=float, default=0.0,
                           help="超过 N 秒收不到帧就退出（生产环境建议 180）")
     p_daemon.add_argument("--quiet", action="store_true", help="不打印进度")
+    p_daemon.add_argument(
+        "--http-port", type=int, default=0,
+        help="同时提供只读 HTTP JSON API 的端口（0=关闭，建议 8790，仅绑定 127.0.0.1）",
+    )
+    p_daemon.add_argument(
+        "--http-token", default=None,
+        help="要求请求带 Authorization: Bearer <token>（可选）",
+    )
     p_daemon.set_defaults(func=_cmd_daemon)
 
     p_sysd = sub.add_parser(
@@ -956,6 +968,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_sysd.add_argument("--exec", help="自定义 himos-psu 可执行路径")
     p_sysd.add_argument("--wait-port", type=float, default=30.0, help="启动时等待串口就绪的秒数")
     p_sysd.add_argument("--stale-timeout", type=float, default=180.0, help="无数据多久后重启")
+    p_sysd.add_argument("--http-port", type=int, default=0,
+                        help="单元里带上 --http-port（0=不启用只读 HTTP API）")
     p_sysd.add_argument("--install", action="store_true", help="写入 user 单元目录而不是打印到 stdout")
     p_sysd.add_argument("--enable", action="store_true", help="安装后执行 systemctl --user enable --now")
     p_sysd.add_argument("--linger", action="store_true", help="同时开启 linger（未登录也采集）")

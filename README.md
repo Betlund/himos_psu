@@ -213,6 +213,28 @@ systemctl --user daemon-reload
 ./bin/himos-psu energy export --kind sessions --out -       # 供电会话
 ```
 
+## 对外接口（只读 HTTP）
+
+守护进程可以顺带提供一个小型只读 HTTP/JSON API，给外部程序（Python / C++ / Rust / Shell /
+Prometheus）读当前功耗、24 小时曲线和电量统计，用来做功耗优化或看板：
+
+```bash
+# 开 API（8790 只是推荐端口，默认关闭）
+./bin/himos-psu daemon --http-port 8790
+
+# 当前功率 / 今日电量
+curl -s localhost:8790/v1/status | jq '.power_w, .energy.today_kwh'
+
+# 过去 24 小时，5 分钟一格
+curl -s 'localhost:8790/v1/history?hours=24&step=300'
+```
+
+端点有 `/v1/status`、`/v1/history`、`/v1/energy`、`/v1/meta`、`/v1/health` 和 Prometheus 的 `/metrics`；
+只绑 `127.0.0.1`、只读，可用 `--http-token` 加 Bearer 鉴权。完整字段与各语言示例见
+[docs/api.md](docs/api.md)，轮询示例见 [examples/api_poll.py](examples/api_poll.py)。
+
+不开端口也可以走原有 Unix socket：`{"cmd": "query", "what": "status"}` 返回同样结构的 JSON。
+
 ## 权限说明
 
 若普通用户无权打开 `/dev/ttyUSB*`，可将用户加入串口所属用户组（如 `uucp` 或 `dialout`），或通过 `./bin/himos-psu udev-rule` 生成标准 `1a86:7523` udev 规则。

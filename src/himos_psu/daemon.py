@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .client import PowerSupplyClient
+from .api import HttpApi, build_status_payload, energy_payload, history_payload
 from .collector import Collector, CollectorBusy, StaleError
 from .config import apply_profile_to_client, load_saved_profile
 from .energy import DEFAULT_DB, EnergyStore
@@ -69,6 +70,8 @@ class Daemon:
         stale_timeout: float = 0.0,
         config_path: str | Path | None = None,
         quiet: bool = False,
+        http_port: int = 0,
+        http_token: str | None = None,
         on_log: Callable[[str], None] | None = None,
     ) -> None:
         self.db_path = Path(db_path or DEFAULT_DB)
@@ -80,7 +83,15 @@ class Daemon:
         self.stale_timeout = float(stale_timeout)
         self.config_path = Path(config_path) if config_path is not None else None
         self.quiet = quiet
+        self.http_port = int(http_port)
+        self.http_token = http_token or None
         self._log = on_log or (lambda text: None)
+        self.api: HttpApi | None = None
+        self._status_lock = threading.Lock()
+        self._last_status: PowerStatus | None = None
+        self._last_status_at: float | None = None
+        self._info: PowerInfo | None = None
+        self._sn = ""
 
         self.client: PowerSupplyClient | None = None
         self.store: EnergyStore | None = None
@@ -91,6 +102,9 @@ class Daemon:
         self._failed = False
         self._thread: threading.Thread | None = None
         self._state = "未启动"
+        # Collector-reported state ("采集中"/"已连接"/...): the API reports progress
+        # messages separately, so a restore notice must not masquerade as the state.
+        self._collector_state = "未启动"
         # Keyed by frame kind (see frame_cache_key): the static specs must be replayed
         # to any late subscriber, the volatile telemetry only in its latest form.
         self._frames: dict[str, dict[str, Any]] = {}
@@ -118,8 +132,8 @@ class Daemon:
         self.collector = Collector(
             self.client,
             self.store,
-            on_state=self._emit,
-            on_status=lambda status: None,
+            on_state=self._on_collector_state,
+            on_status=self._on_status,
             on_frame=self._on_frame,
             on_specs=self._on_specs,
             on_first_status=self._maybe_restore,
@@ -141,6 +155,23 @@ class Daemon:
                 self.store.close()
                 self.store = None
             raise
+
+        if self.http_port > 0:
+            self.api = HttpApi(
+                self.db_path,
+                status_provider=self._live_status,
+                state_provider=lambda: self._collector_state,
+                info_provider=lambda: self._info,
+                sn_provider=lambda: self._sn,
+                port=self.http_port,
+                token=self.http_token,
+                on_log=self._emit,
+            )
+            try:
+                self.api.start()
+            except Exception as exc:
+                self.api = None
+                self._emit(f"HTTP API 启动失败（端口 {self.http_port}）: {exc}")
 
         self._emit("守护进程启动，正在连接电源…")
         self._thread = threading.Thread(target=self._run_collector, name="himos-collector", daemon=True)
@@ -178,6 +209,9 @@ class Daemon:
 
     def stop(self) -> None:
         self._stop.set()
+        if self.api is not None:
+            self.api.stop()
+            self.api = None
         if self.server is not None:
             self.server.stop()
             self.server = None
@@ -244,7 +278,25 @@ class Daemon:
             self._frames.pop(victim, None)
         self._broadcast(payload)
 
+    def _on_collector_state(self, text: str) -> None:
+        self._collector_state = text
+        self._emit(text)
+
+    def _on_status(self, status: PowerStatus) -> None:
+        with self._status_lock:
+            self._last_status = status
+            self._last_status_at = time.time()
+
+    def _live_status(self) -> tuple[PowerStatus | None, float | None]:
+        with self._status_lock:
+            return self._last_status, self._last_status_at
+
     def _on_specs(self, info: PowerInfo | None, sn: str) -> None:
+        with self._status_lock:
+            if info is not None:
+                self._info = info
+            if sn:
+                self._sn = sn
         if info is not None:
             self._log(
                 f"电源: {info.model} / {info.firmware_display} / {info.manufacture or '未知厂商'}"
@@ -280,6 +332,41 @@ class Daemon:
                 self._emit("已恢复保存的配置: " + " + ".join(parts))
 
     # -- IPC ---------------------------------------------------------------
+    def _query_payload(self, message: dict[str, Any]) -> dict[str, Any]:
+        """Decoded answers for socket clients that do not speak HTTP."""
+        what = str(message.get("what", "status"))
+        if what == "status":
+            if self.api is not None:
+                return self.api.status()
+            status, received_at = self._live_status()
+            return build_status_payload(status, received_at, self._collector_state, self._info, None)
+        if what == "meta":
+            status, received_at = self._live_status()
+            payload = {
+                "schema": 1,
+                "state": self._collector_state,
+                "model": self._info.model if self._info else None,
+                "firmware": self._info.firmware_display if self._info else None,
+                "rated_power_w": self._info.rated_power if self._info else None,
+                "fan_mode": status.mode.name.lower() if status else None,
+                "age_s": round(time.time() - received_at, 3) if received_at else None,
+            }
+            if message.get("sn"):
+                payload["sn"] = self._sn or None
+            return payload
+        if what == "energy":
+            if self.store is None:
+                raise RuntimeError("能耗数据库尚未打开")
+            name = str(message.get("range", "today"))
+            return energy_payload(self.store, name, bool(message.get("bands")))
+        if what == "history":
+            if self.store is None:
+                raise RuntimeError("能耗数据库尚未打开")
+            return history_payload(
+                self.store, float(message.get("hours", 24)), int(message.get("step", 300))
+            )
+        raise ValueError(f"未知查询 {what!r}（status/meta/energy/history）")
+
     def _send_snapshot(self, write: Callable[[dict[str, Any]], bool]) -> None:
         write({"event": "state", "text": self._state})
         for payload in list(self._frames.values()):
@@ -293,6 +380,8 @@ class Daemon:
 
         if cmd in ("snapshot", "status"):
             return None
+        if cmd == "query":
+            return {"payload": self._query_payload(message)}
         if cmd == "set_fan_mode":
             mode = FanMode(int(message["mode"]))
             points = message.get("points")

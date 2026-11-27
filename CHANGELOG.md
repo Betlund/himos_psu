@@ -6,6 +6,12 @@
 
 ### 新增
 
+- **只读 HTTP/JSON API**（`daemon --http-port 8790`）：`/v1/status`（功率/电压/温度/风扇 + 今日本月累计）、
+  `/v1/history`（默认 24 h × 5 分钟，`step` 可选 60/300/900/3600）、`/v1/energy`（今日/昨日/本周/本月/今年）、
+  `/v1/meta`、`/v1/health` 与 Prometheus `/metrics`。只绑 127.0.0.1、只读、可选 Bearer token；
+  数据过期用 `age_s`/`stale` 标出，缺口返回 `null` 而不是 0 W。
+- Unix socket 新增 `{"cmd":"query"}` 已解码查询（status/meta/energy/history），不开端口也能拿结构化数据。
+- `docs/api.md` 与 `examples/api_poll.py`：curl/Python/C++/Rust/Prometheus 示例。
 - 点击日历某天后，曲线的说明行直接给出当日合计：`2026-11-27 · 共 1.477 kWh · ¥0.82 · 峰值 415 W`。
 - 「最近供电会话」改为显示 `起 → 止`（仍在采集的写「至今」并带 ⁺ 标记），并加一行说明什么是会话。
 - 「累计用电」从**首个真正采集过的日子**起算（默认要求当天至少 10 分钟数据），

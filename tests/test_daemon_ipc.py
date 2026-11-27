@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
+import socket
+import urllib.request
 import subprocess
 import sys
 import tempfile
@@ -176,6 +179,60 @@ class DaemonTestCase(unittest.TestCase):
             self.assertGreater(store.sample_count(), 0)
         finally:
             store.close()
+
+    def test_http_api_and_socket_query_answer_with_decoded_values(self) -> None:
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        http_port = probe.getsockname()[1]
+        probe.close()
+        daemon = Daemon(
+            db_path=self.dir / "api.db",
+            socket_path=self.dir / "api.sock",
+            mock=True,
+            restore=False,
+            quiet=True,
+            http_port=http_port,
+        )
+        daemon.start()
+        try:
+            self.assertTrue(wait_for(lambda: probe_socket(daemon.socket_path)))
+            url = f"http://127.0.0.1:{http_port}/v1/status"
+
+            def status_ready() -> bool:
+                try:
+                    with urllib.request.urlopen(url, timeout=2) as response:
+                        payload = json.loads(response.read().decode())
+                except Exception:
+                    return False
+                return payload.get("power_w") is not None
+
+            self.assertTrue(wait_for(status_ready, timeout=8.0), "HTTP 状态接口没有拿到实时数据")
+            with urllib.request.urlopen(url, timeout=2) as response:
+                payload = json.loads(response.read().decode())
+            self.assertGreater(payload["power_w"], 0)
+            self.assertIn("rails_v", payload)
+            self.assertIn("energy", payload)
+            self.assertFalse(payload["stale"])
+
+            events: list[dict] = []
+            client = SocketClient(daemon.socket_path, on_event=events.append)
+            try:
+                client.command(cmd="query", what="status")
+                self.assertTrue(
+                    wait_for(
+                        lambda: any(
+                            e.get("event") == "ack" and e.get("cmd") == "query" and e.get("ok")
+                            for e in events
+                        )
+                    )
+                )
+                ack = [e for e in events if e.get("event") == "ack"][-1]
+                self.assertGreater(ack["payload"]["power_w"], 0)
+                self.assertIn("energy", ack["payload"])
+            finally:
+                client.close()
+        finally:
+            daemon.stop()
 
     def test_snapshot_keeps_static_frames_after_telemetry_churn(self) -> None:
         """A subscriber joining hours later must still receive the specs.
