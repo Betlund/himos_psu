@@ -263,7 +263,7 @@ curl -s 'localhost:8790/v1/history?hours=24&step=300'
 
 ## 更新日志
 
-见 [CHANGELOG.md](CHANGELOG.md)，当前版本 [v0.2.0](https://github.com/Betlund/himos_psu/releases/tag/v0.2.0)。
+见 [CHANGELOG.md](CHANGELOG.md)，当前版本 [v0.2.1](https://github.com/Betlund/himos_psu/releases/tag/v0.2.1)。
 
 ## 开源协议
 

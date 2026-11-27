@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "himos-psu"
-version = "0.2.0"
+version = "0.2.1"
 description = "Open-source Linux monitor, fan controller and energy tracker for Segotep / Kunlun HiMOS digital power supplies (e.g. KE-1300P)"
 readme = "README.md"
 license = "MIT"
